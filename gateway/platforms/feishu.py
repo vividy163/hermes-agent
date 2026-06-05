@@ -871,6 +871,40 @@ def normalize_feishu_message(
         return _normalize_share_chat_message(payload)
     if normalized_type in {"interactive", "card"}:
         return _normalize_interactive_message(normalized_type, payload)
+    if normalized_type == "location":
+        # Feishu `location` payload: {"name": str, "longitude": str, "latitude": str}.
+        # Surface a human-readable line to the agent AND a structured metadata
+        # entry so downstream skills (find-nearby / maps / hotel_search) can
+        # consume coordinates without re-parsing text.
+        name = str(payload.get("name", "") or "").strip()
+        latitude = str(payload.get("latitude", "") or "").strip()
+        longitude = str(payload.get("longitude", "") or "").strip()
+        parts = ["[📍 位置情報]"]
+        if name:
+            parts.append(name)
+        if latitude and longitude:
+            parts.append(f"緯度: {latitude}, 経度: {longitude}")
+        location_meta: Dict[str, Any] = {}
+        if latitude:
+            try:
+                location_meta["latitude"] = float(latitude)
+            except ValueError:
+                location_meta["latitude_raw"] = latitude
+        if longitude:
+            try:
+                location_meta["longitude"] = float(longitude)
+            except ValueError:
+                location_meta["longitude_raw"] = longitude
+        if name:
+            location_meta["name"] = name
+        metadata: Dict[str, Any] = {}
+        if location_meta:
+            metadata["location"] = location_meta
+        return FeishuNormalizedMessage(
+            raw_type=normalized_type,
+            text_content=" ".join(parts),
+            metadata=metadata,
+        )
 
     return FeishuNormalizedMessage(raw_type=normalized_type, text_content="")
 

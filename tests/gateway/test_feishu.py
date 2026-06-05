@@ -159,6 +159,61 @@ class TestFeishuMessageNormalization(unittest.TestCase):
             "Build Failed\nService: payments-api\nBranch: main\nView Logs\nRetry\nActions: View Logs, Retry",
         )
 
+    def test_normalize_location_exposes_text_and_structured_metadata(self):
+        from gateway.platforms.feishu import normalize_feishu_message
+
+        normalized = normalize_feishu_message(
+            message_type="location",
+            raw_content=json.dumps(
+                {"name": "Tokyo Tower", "longitude": "139.7454", "latitude": "35.6586"}
+            ),
+        )
+
+        self.assertEqual(normalized.raw_type, "location")
+        self.assertEqual(
+            normalized.text_content,
+            "[📍 位置情報] Tokyo Tower 緯度: 35.6586, 経度: 139.7454",
+        )
+        # Structured location for downstream skills (find-nearby / maps /
+        # hotel_search) without re-parsing the text.
+        self.assertEqual(normalized.metadata["location"]["name"], "Tokyo Tower")
+        self.assertEqual(normalized.metadata["location"]["latitude"], 35.6586)
+        self.assertEqual(normalized.metadata["location"]["longitude"], 139.7454)
+
+    def test_normalize_location_handles_missing_name(self):
+        from gateway.platforms.feishu import normalize_feishu_message
+
+        normalized = normalize_feishu_message(
+            message_type="location",
+            raw_content=json.dumps({"longitude": "139.7454", "latitude": "35.6586"}),
+        )
+
+        self.assertEqual(
+            normalized.text_content, "[📍 位置情報] 緯度: 35.6586, 経度: 139.7454"
+        )
+        self.assertNotIn("name", normalized.metadata["location"])
+        self.assertEqual(normalized.metadata["location"]["latitude"], 35.6586)
+
+    def test_normalize_location_falls_back_to_raw_strings_on_unparseable_coords(self):
+        from gateway.platforms.feishu import normalize_feishu_message
+
+        normalized = normalize_feishu_message(
+            message_type="location",
+            raw_content=json.dumps(
+                {"name": "Mystery Spot", "longitude": "abc", "latitude": "def"}
+            ),
+        )
+
+        # Coordinates couldn't be parsed as float — fall back to *_raw so
+        # downstream code can still observe the bad payload rather than
+        # silently dropping it.
+        self.assertEqual(
+            normalized.text_content, "[📍 位置情報] Mystery Spot 緯度: def, 経度: abc"
+        )
+        self.assertEqual(normalized.metadata["location"]["latitude_raw"], "def")
+        self.assertEqual(normalized.metadata["location"]["longitude_raw"], "abc")
+        self.assertNotIn("latitude", normalized.metadata["location"])
+
 
 class TestFeishuAdapterMessaging(unittest.TestCase):
     @patch.dict(os.environ, {
