@@ -7661,7 +7661,8 @@ class GatewayRunner:
                     # either don't expose this hook (Telegram updates
                     # the message at click time) or route through their
                     # own mechanism.
-                    if self._status_adapter.__class__.__name__ == "FeishuAdapter":
+                    _active_adapter = self.adapters.get(source.platform)
+                    if _active_adapter and _active_adapter.__class__.__name__ == "FeishuAdapter":
                         try:
                             from gateway.platforms.feishu import (
                                 _feishu_fire_after_resolve_hook,
