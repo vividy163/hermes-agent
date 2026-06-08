@@ -35,7 +35,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -147,18 +147,51 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
 # Public API — gateway / adapter side
 # =========================================================================
 
-def resolve_gateway_clarify(clarify_id: str, response: str) -> bool:
+def resolve_gateway_clarify(clarify_id: str, response: str, *, source: str = "text") -> bool:
     """Unblock the agent thread waiting on ``clarify_id``.
+
+    Args:
+        clarify_id: The pending entry to resolve.
+        response: The user's chosen text (or free-form reply).
+        source: Where the resolve came from. One of:
+            ``"button"`` — user clicked a UI button (rich adapter, e.g.
+                Telegram ``InlineKeyboardButton`` or Feishu card action).
+                After-resolve hooks registered with ``fire_on=("button",)``
+                fire; those registered for text-only (the Feishu PATCH
+                hook) are skipped, since the button path already updated
+                the message in place via the click-ack response.
+            ``"text"`` — user typed a free-form reply captured by the
+                gateway's text-intercept. Default. Fires all registered
+                hooks whose ``fire_on`` includes ``"text"``; this is the
+                only path that needs a server-side PATCH to update the
+                sent card (no click-ack was generated).
+            ``"auto"`` — explicit "fire unconditionally" sentinel for
+                tests and edge cases (timeout, session reset). Fires all
+                registered hooks regardless of ``fire_on``.
 
     Returns True if an entry was found and resolved, False otherwise
     (already resolved, expired, or never existed).
     """
+    if source not in ("button", "text", "auto"):
+        # Defensive: an unknown source means a caller is using the API
+        # wrong. Fall back to "text" (the historically-safe behavior,
+        # which is also the only path that exists for non-rich adapters).
+        logger.warning(
+            "[clarify_gateway] resolve_gateway_clarify got unknown source=%r; "
+            "treating as 'text'",
+            source,
+        )
+        source = "text"
     with _lock:
         entry = _entries.get(clarify_id)
         if entry is None:
             return False
     entry.response = str(response) if response is not None else ""
     entry.event.set()
+    # Fire-and-forget after-resolve side effects (e.g. card PATCH).
+    # Released the lock before invoking so the hook can re-enter
+    # clarify_gateway APIs (e.g. clear_session) without deadlocking.
+    _fire_after_resolve(clarify_id, entry.response, source=source)
     return True
 
 
@@ -191,6 +224,130 @@ def mark_awaiting_text(clarify_id: str) -> bool:
             return False
         entry.awaiting_text = True
         return True
+
+
+# Per-clarify after-resolve hooks.
+#
+# Adapters that need to run side effects when a clarify entry resolves
+# (e.g. Feishu PATCHing a sent card to "received" state) can register a
+# one-shot callback keyed by ``clarify_id``.  When ``resolve_gateway_clarify``
+# actually fires the resolve, the hook is invoked with the user's chosen
+# text and then consumed.  Exceptions raised by the hook are logged and
+# swallowed so a buggy adapter can never block the agent thread.
+#
+# This sits next to the existing ``register_notify`` pattern but at a
+# finer granularity (per-clarify rather than per-session) so that the
+# hook can carry the message_id or other call-site context that
+# ``register_notify`` doesn't have access to.
+#
+# Each entry stores ``(callback, fire_on)`` where ``fire_on`` is the set
+# of resolve sources the hook wants to fire on.  The default
+# ``("text",)`` matches the historical "fire on every resolve" behavior
+# closely enough that existing tests pass — but a hook that wants to
+# distinguish "I just got a click" from "I just got a typed reply" can
+# opt into ``fire_on=("button",)`` (or both, or ``("auto",)`` for the
+# timeout/clear_session path).
+_AfterResolveCB = Tuple[Callable[[str], None], Tuple[str, ...]]
+_after_resolve_cbs: Dict[str, _AfterResolveCB] = {}
+
+
+def register_after_resolve(
+    clarify_id: str,
+    callback: Callable[[str], None],
+    *,
+    fire_on: Tuple[str, ...] = ("text",),
+) -> bool:
+    """Register a one-shot callback fired when ``clarify_id`` resolves.
+
+    The callback receives the resolved choice text as its sole argument.
+    Returns True if registered against an existing entry, False otherwise
+    (the entry may have already been resolved/cleared).
+
+    Args:
+        clarify_id: The pending entry to hook onto.
+        callback: Function called with the resolved text.
+        fire_on: Tuple of resolve sources this hook cares about. The
+            callback fires only when ``resolve_gateway_clarify`` is
+            called with a matching ``source`` (or with ``source="auto"``,
+            which fires every hook regardless of ``fire_on``).
+            Default ``("text",)`` preserves the historical "fire on
+            resolve" behavior for callers that don't care about the
+            source.  Use ``("button",)`` for side effects that should
+            only run on UI button clicks (e.g. the Feishu PATCH hook,
+            which the click-ack already covered), or ``("button",
+            "text")`` for hooks that need both.
+    """
+    # Normalize and validate fire_on.
+    normalized = tuple(s for s in fire_on if s in ("button", "text", "auto"))
+    if not normalized:
+        # Empty fire_on means "never fire" — almost certainly a caller
+        # bug. Surface it loudly and refuse the registration so the
+        # adapter code can fail fast in tests.
+        logger.warning(
+            "[clarify_gateway] register_after_resolve: fire_on=%r is empty after "
+            "normalization; refusing to register hook for clarify_id=%s",
+            fire_on,
+            clarify_id,
+        )
+        return False
+    with _lock:
+        if _entries.get(clarify_id) is None:
+            return False
+        _after_resolve_cbs[clarify_id] = (callback, normalized)
+    return True
+
+
+def _fire_after_resolve(clarify_id: str, choice_text: str, *, source: str) -> None:
+    """Pop and invoke the registered hook if its ``fire_on`` matches ``source``.
+
+    Errors raised by the hook are swallowed (logged). A hook registered
+    with a non-matching ``fire_on`` is consumed silently (popped from the
+    dict) so it does not leak across clarifies. ``source="auto"`` matches
+    every registered hook (the timeout/clear_session path).
+    """
+    with _lock:
+        entry = _after_resolve_cbs.pop(clarify_id, None)
+        total = len(_after_resolve_cbs)
+    if entry is None:
+        logger.debug(
+            "[clarify_gateway] _fire_after_resolve: no hook for clarify_id=%s "
+            "(remaining_hooks=%d, choice_text=%r, source=%r)",
+            clarify_id,
+            total,
+            choice_text,
+            source,
+        )
+        return
+    callback, fire_on = entry
+    if source != "auto" and source not in fire_on:
+        logger.debug(
+            "[clarify_gateway] _fire_after_resolve: hook for clarify_id=%s "
+            "skipped (source=%r not in fire_on=%r, choice_text=%r, "
+            "remaining_hooks=%d)",
+            clarify_id,
+            source,
+            fire_on,
+            choice_text,
+            total,
+        )
+        return
+    logger.debug(
+        "[clarify_gateway] _fire_after_resolve: firing hook for clarify_id=%s "
+        "(choice_text=%r, source=%r, fire_on=%r, remaining_hooks=%d)",
+        clarify_id,
+        choice_text,
+        source,
+        fire_on,
+        total,
+    )
+    try:
+        callback(choice_text)
+    except Exception:
+        logger.warning(
+            "[clarify_gateway] after_resolve hook for %s raised; swallowed",
+            clarify_id,
+            exc_info=True,
+        )
 
 
 def has_pending(session_key: str) -> bool:

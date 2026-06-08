@@ -59,6 +59,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -69,6 +70,11 @@ from typing import Any, Dict, List, Literal, Optional, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+try:
+    import httpx
+except ImportError:
+    httpx = None  # type: ignore[assignment]
 
 # aiohttp/websockets are independent optional deps — import outside lark_oapi
 # so they remain available for tests and webhook mode even if lark_oapi is missing.
@@ -1504,6 +1510,12 @@ class FeishuAdapter(BasePlatformAdapter):
         # Update prompt button state (prompt_id → {session_key, message_id, chat_id})
         self._update_prompt_state: Dict[int, Dict[str, str]] = {}
         self._update_prompt_counter = itertools.count(1)
+        # Clarify card localization cache: clarify_id → language code resolved
+        # at send_clarify time.  We pop on button click so the dict stays
+        # bounded by the number of currently-pending clarifies.  When the
+        # user resolves by typed text instead, the entry is naturally
+        # cleared by the same out-of-band event (or by clear_session).
+        self._clarify_lang: Dict[str, str] = {}
         # Feishu reaction deletion requires the opaque reaction_id returned
         # by create, so we cache it per message_id.
         self._pending_processing_reactions: "OrderedDict[str, str]" = OrderedDict()
@@ -1896,6 +1908,611 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("[Feishu] Failed to edit message %s: %s", message_id, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
+
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[list],
+        clarify_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Render a clarify prompt as a Feishu interactive card with one button per choice.
+
+        The agent thread (gateway's _clarify_callback_sync) has already called
+        ``tools.clarify_gateway.register(clarify_id, session_key, question, choices)``
+        and will block on ``wait_for_response(clarify_id, timeout)`` after we
+        return.  This override's job is therefore narrow: send the card and let
+        the button-click path or the text-intercept path resolve the registered
+        entry via ``resolve_gateway_clarify``.  Do NOT call register/wait_for_response
+        from here — that lives on the agent thread.
+
+        Behavior:
+        - The card is a "shared card" (config.update_multi: true) so it can
+          be PATCHed later to "received" state once the user answers.
+        - choices is non-empty: render one button per choice (NO "Other"
+          button — the user simply replies with free text, which the
+          gateway's text-intercept captures via awaiting_text).
+        - choices is empty/None: render the question as plain markdown text
+          (no buttons).  The next text message resolves via the existing
+          text-intercept path (``_maybe_intercept_clarify_text``).
+        - Either way, we flip the entry into text-capture mode immediately
+          after a successful send so the next free-form text message in
+          this session is captured as the answer.
+
+        Why text-capture is flipped unconditionally (not only on the
+        "Other" branch, unlike base.py default / Telegram):
+          The Feishu mobile client's inline buttons are limited to ~28
+          mb_strwidth before the label gets truncated or wrapped, and we
+          cap choices at 4 to fit one button per row in the card.  There
+          is no room for a dedicated "✏️ Other" button, and adding a
+          5th row in a different column would push the question body out
+          of the visible fold.  So the user is told in the question
+          body to "type your own answer" and we keep text-capture
+          always-on — if they pick a button the click-ack path
+          resolves; if they type, the text-intercept resolves.  See the
+          ``feishu-clarify-card-debugging`` SKILL (Class 4) for the
+          trade-off history.
+
+        On success returns ``SendResult(success=True, message_id=...)``
+        and registers an after-resolve hook that PATCHes the card to
+        a "received" state when the user answers **by typed text**
+        (the PATCH hook uses ``fire_on=("text",)``; button clicks
+        already update the card in place via the click-ack response
+        and must NOT race the PATCH).
+        - On send failure returns ``SendResult(success=False, error=...)``;
+          the caller will clear the registered entry and surface a sentinel.
+
+        Localization: card text is rendered via ``agent.i18n.t()`` and
+        honors the active language.  The gateway resolves the language
+        and threads it through ``metadata["language"]`` (see
+        ``gateway.run._clarify_callback_sync``).  Resolution order
+        inside ``t()`` is HERMES_LANGUAGE env > display.language
+        config > "en" -- a missing metadata key just means "use
+        whatever the process default is".  The ``question`` argument
+        and the choice bodies are passed through verbatim: they come
+        from the LLM and translating them would risk semantic drift.
+        """
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+
+        # Resolve the active language once, then thread it into the
+        # card builders below.  Pulling it from metadata keeps the
+        # signature unchanged and matches the convention used by the
+        # rest of the gateway (where ``metadata`` is the channel for
+        # cross-cutting per-message hints like thread_id).
+        lang = (metadata or {}).get("language")
+
+        try:
+            # The Feishu mobile client breaks choice buttons whose mb_strwidth >= 28
+            # (PC handles up to 40 chars). When any choice exceeds 28,
+            # collapse button labels to A/B/C/D and expand full text in the question body
+            # as "A: <text>\nB: <text>..." (value.choice keeps the original string so the resolve path is preserved).
+            def _display_width(s: str) -> int:
+                """PHP's mb_strwidth equivalent (East Asian Width based, full-width=2 / half-width=1)."""
+                w = 0
+                for c in s:
+                    if unicodedata.east_asian_width(c) in ("W", "F"):
+                        w += 2
+                    else:
+                        w += 1
+                return w
+
+            def _extract_choice_text(c: Any) -> str:
+                """Extract a string body from a choice the LLM may pass in
+                dict form (``{"value": "1"}``) instead of the schema's
+                flat string list.
+
+                Why this lives here (Feishu L3 only — observed problem,
+                not speculative defense):
+
+                * **Observed**: the Feishu client accepts the Python dict
+                  repr (``"{'value': '1'}"``) as a button label, so a
+                  choice like ``{"value": "1"}`` ends up rendered as the
+                  literal string ``"{'value': '1'}"`` on the button. The
+                  same repr then flows back through the resolve path
+                  (``_handle_clarify_card_action``), and the agent sees
+                  ``user_response = "{'value': '1'}"`` instead of ``"1"``
+                  — a Class 2-style display/resolve mismatch that breaks
+                  tool-calling. See ``feishu-clarify-card-debugging`` Class 6
+                  for the full incident.
+                * **Other platforms** (Telegram/Discord/Slack) reject dict
+                  input at the API layer, so this extraction is
+                  Feishu-internal only and never lives in L2
+                  (``tools/clarify_tool.py``).
+                * **Priority**: ``.value`` > ``.label`` > ``.text`` — first
+                  non-empty string wins.
+                * **Fallback**: returns ``""`` (NOT ``str(c)``). The dict
+                  repr would otherwise leak into the resolve path.
+                """
+                if isinstance(c, dict):
+                    extracted = c.get("value")
+                    if extracted in (None, ""):
+                        extracted = c.get("label")
+                    if extracted in (None, ""):
+                        extracted = c.get("text")
+                    if extracted in (None, ""):
+                        return ""
+                    return str(extracted)
+                return str(c)
+
+            _FEISHU_BUTTON_SAFE_WIDTH = 28
+            _BUTTON_LABELS = ("A", "B", "C", "D")
+
+            # Resolve the "type your own answer" hint once.  The
+            # Feishu card has no "✏️ Other" button (mobile client
+            # width + 4-button column cap), so the user is told in
+            # the question body to type their answer instead.  The
+            # hint sits directly above the action button row, never
+            # below it (Feishu renders the action block at the bottom
+            # of the card with no trailing whitespace, so anything
+            # appended after would be clipped).
+            type_to_answer_hint = "(or type your own answer)"
+
+            elements: List[Dict[str, Any]] = [
+                {"tag": "markdown", "content": f"❓ {question}"},
+            ]
+
+            if choices:
+                # L2 (clarify_tool) does not normalize dict choices, so we
+                # extract the ``{"value": ...}`` form to a string here
+                # (the Feishu client accepts dict repr as a button label,
+                # so we defend inside the Feishu adapter only).
+                # Other platforms reject at the API layer so this is unnecessary there.
+                choices = [_extract_choice_text(c) for c in choices]
+                # Feishu caps action buttons per row; keep ≤4 choices per row.
+                # We use one column per button for a clean vertical stack.
+                # If any choice exceeds 28, trigger the A/B/C/D fallback.
+                use_abcd = any(
+                    _display_width(c) >= _FEISHU_BUTTON_SAFE_WIDTH
+                    for c in choices
+                )
+                buttons: List[Dict[str, Any]] = []
+                if use_abcd:
+                    # List all choice bodies in the question body as "A: <text>" form
+                    choices_listing = "\n".join(
+                        f"{_BUTTON_LABELS[i]}: {c}"
+                        for i, c in enumerate(choices)
+                    )
+                    elements[0] = {
+                        "tag": "markdown",
+                        "content": (
+                            f"❓ {question}\n\n{choices_listing}\n\n{type_to_answer_hint}"
+                        ),
+                    }
+                else:
+                    # Short labels: question body is just the question +
+                    # the type-to-answer hint.  No per-choice listing in
+                    # the body since the buttons themselves show the
+                    # full label.
+                    elements[0] = {
+                        "tag": "markdown",
+                        "content": (
+                            f"❓ {question}\n\n{type_to_answer_hint}"
+                        ),
+                    }
+                for idx, choice in enumerate(choices):
+                    # NOTE: previously a 30-char safety truncation was applied
+                    # here (label = label[:27] + "…"). Removed 2026-06-05 —
+                    # it caused Class 2 (text.content != value.choice) for any
+                    # choice longer than 30 chars. We now send the full label
+                    # as-is and let the Feishu client render however it wants.
+                    # If this breaks long-choice rendering again, add a guard
+                    # at the L2 boundary (tools/clarify_tool.py), not here.
+                    #
+                    # Added 2026-06-05: the mobile client's broken display of
+                    # choice buttons whose mb_strwidth >= 28 is avoided by
+                    # collapsing labels to A/B/C/D and listing full text in the
+                    # question body in `A: <text>` form. value.choice keeps the
+                    # original string (resolve path operates on full text).
+                    if use_abcd:
+                        label = _BUTTON_LABELS[idx]
+                    else:
+                        label = choice
+                    buttons.append({
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": label},
+                        "type": "default",
+                        "value": {
+                            "hermes_clarify": True,
+                            "clarify_id": clarify_id,
+                            "choice": choice,
+                        },
+                    })
+                # No "Other" button — the user just replies with free text.
+                # awaiting_text is flipped below so the next text message
+                # is captured by the gateway text-intercept.
+                elements.append({"tag": "action", "actions": buttons})
+            else:
+                # No choices (open-ended): the question is the whole
+                # body.  Append the type-to-answer hint so the user
+                # knows the response is just a free-text reply.
+                elements[0] = {
+                    "tag": "markdown",
+                    "content": f"❓ {question}\n\n{type_to_answer_hint}",
+                }
+                # No buttons to append; the next inbound text message
+                # resolves via the gateway text-intercept.
+                pass  # handled after the send completes successfully
+
+            card: Dict[str, Any] = {
+                "config": {"wide_screen_mode": True, "update_multi": True},
+                "header": {
+                    "title": {"content": "🤔 Please select", "tag": "plain_text"},
+                    "template": "blue",
+                },
+                "elements": elements,
+            }
+            payload = json.dumps(card, ensure_ascii=False)
+
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="interactive",
+                payload=payload,
+                reply_to=None,
+                metadata=metadata,
+            )
+            result = self._finalize_send_result(response, "send_clarify failed")
+            if not result.success:
+                logger.warning("[Feishu] send_clarify send failed: %s", result.error)
+                return SendResult(success=False, error=result.error)
+            # Feishu's CreateMessage response always carries data.message_id
+            # on success per the Open API spec — trust the SDK to expose it.
+            message_id = result.message_id
+            # Card sent successfully.  Flip the entry into text-capture mode
+            # so the user can also answer by typing free text (no "Other"
+            # button is shown — see the function docstring for the Feishu-
+            # specific rationale).  ``tools.clarify_gateway`` is a same-package
+            # module that is always importable here; no defensive try/except
+            # needed (Class 6: speculative over-defense).
+            from tools.clarify_gateway import mark_awaiting_text
+            mark_awaiting_text(clarify_id)
+            # Register an after-resolve hook that PATCHes the card to a
+            # "received" state when the user answers by typed text (the
+            # hook is registered with fire_on=("text",) — button clicks
+            # skip this hook because the click-ack already updated the
+            # card in place).
+            if message_id:
+                # Cache the resolved language so the button-click path
+                # can render the resolved card in the same language.
+                if lang:
+                    self._clarify_lang[clarify_id] = lang
+                self._register_clarify_card_patch_hook(
+                    clarify_id=clarify_id,
+                    message_id=message_id,
+                    chat_id=chat_id,
+                    lang=lang,
+                )
+            return SendResult(
+                success=True,
+                message_id=message_id,
+            )
+        except Exception as exc:
+            logger.warning("[Feishu] send_clarify failed: %s", exc, exc_info=True)
+            return SendResult(success=False, error=str(exc))
+
+    @staticmethod
+    def _build_resolved_clarify_card(*, choice: str, lang: Optional[str] = None) -> Dict[str, Any]:
+        """Build raw card JSON showing the selected choice (closes the buttons).
+
+        Returned to the card action callback so Feishu replaces the
+        buttons with this resolved view in the same message.  Marked as
+        a shared card (``update_multi: true``) for consistency with the
+        PATCH-based resolve path.
+
+        ``lang`` controls the localized strings (header + body).  Falls
+        back to the process default when ``None`` -- same convention as
+        the other t() callsites in this file.
+        """
+        return {
+            "config": {"wide_screen_mode": True, "update_multi": True},
+            "header": {
+                "title": {"content": "✅ Selected", "tag": "plain_text"},
+                "template": "green",
+            },
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": f"✅ You selected **{choice}**",
+                },
+            ],
+        }
+
+    def _handle_clarify_card_action(
+        self, *, event: Any, action_value: Dict[str, Any]
+    ) -> Any:
+        """Resolve a registered clarify entry from a Feishu card button click.
+
+        Mirrors the approval-card pattern (also a sync def).  The web
+        framework dispatches card-action events synchronously, so this
+        must be sync too — if we make it async, the framework receives
+        the coroutine object as a return value, then tries to
+        ``json.dumps`` it and blows up with
+        ``Object of type coroutine is not JSON serializable``.
+
+        We schedule the resolve coroutine on the adapter loop via
+        ``_submit_on_loop`` (returns immediately) and return a
+        ``P2CardActionTriggerResponse`` carrying the updated card body so
+        Feishu replaces the buttons with the resolved view in-place.
+
+        Authorization: mirrors the approval / update-prompt paths.  The
+        button clicker is checked against ``_admins`` /
+        ``_allowed_group_users`` so a non-operator user in a group chat
+        cannot drive someone else's pending clarify (Feishu card clicks
+        carry the clicker's ``open_id`` in ``event.operator``).  We do
+        NOT enforce this on the text-intercept path — typing in chat is
+        already gated by the gateway's normal message handler
+        (``_handle_message``), which uses the sender (not the responder)
+        of the message as the authorization anchor.
+        """
+        clarify_id = action_value.get("clarify_id")
+        choice = action_value.get("choice", "")
+        if not clarify_id:
+            logger.debug("[Feishu] Clarify card action missing clarify_id, ignoring")
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+
+        # Operator authorization (mirrors _handle_update_prompt_action).
+        operator = getattr(event, "operator", None)
+        open_id = str(getattr(operator, "open_id", "") or "")
+        if not self._is_interactive_operator_authorized(open_id):
+            logger.warning(
+                "[Feishu] Unauthorized clarify card click by %s",
+                open_id or "<unknown>",
+            )
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+
+        loop = self._loop
+        if not self._loop_accepts_callbacks(loop):
+            logger.warning("[Feishu] Dropping clarify action before adapter loop is ready")
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+
+        async def _resolve() -> None:
+            from tools.clarify_gateway import resolve_gateway_clarify
+
+            # No "__other__" branch: there is no Other button anymore.  The
+            # text-intercept path handles free-form text replies.  ``source="button"``
+            # tells the registry to skip ``fire_on=("text",)`` hooks (the Feishu
+            # PATCH hook) — the click-ack below already updated the card in place.
+            resolved = resolve_gateway_clarify(clarify_id, str(choice), source="button")
+            if not resolved:
+                logger.debug(
+                    "[Feishu] Clarify %s already resolved or unknown", clarify_id,
+                )
+
+        self._submit_on_loop(loop, _resolve())
+
+        if P2CardActionTriggerResponse is None or CallBackCard is None:
+            return None
+        response = P2CardActionTriggerResponse()
+        card = CallBackCard()
+        card.type = "raw"
+        # ``lang`` is captured at send_clarify time (not on click) so
+        # the resolved card body matches the language of the original
+        # prompt -- even if the user changes their display.language
+        # setting between the prompt and the click.
+        resolved_lang = self._clarify_lang.pop(clarify_id, None)
+        card.data = self._build_resolved_clarify_card(choice=str(choice), lang=resolved_lang)
+        response.card = card
+        return response
+
+    def _register_clarify_card_patch_hook(
+        self,
+        *,
+        clarify_id: str,
+        message_id: str,
+        chat_id: str,
+        lang: Optional[str] = None,
+    ) -> None:
+        """Register an after-resolve hook that PATCHes the sent card to
+        "received" state when the user answers by **typed text** only.
+
+        The hook is fire-and-forget: the call site (``send_clarify``) does
+        NOT block on the PATCH.  A PATCH failure is logged but does not
+        affect the agent thread.
+
+        Why ``fire_on=("text",)`` (button clicks are intentionally excluded):
+        The button-click path already updates the card in place via the
+        ``P2CardActionTriggerResponse`` returned from
+        ``_handle_clarify_card_action`` (the user sees the "✅ You
+        selected X" view immediately, no server roundtrip needed).  If we
+        also fired this PATCH on button clicks we'd race the click-ack
+        and the user would see the card updated twice (or flicker
+        between two near-identical views).  Typed text replies have no
+        click-ack — the gateway's text-intercept is the only place that
+        knows the user answered — so the PATCH is the only way to reflect
+        the resolve back onto the message in the chat history.
+
+        ``lang`` is captured at registration time (send_clarify resolves
+        it from metadata) and passed through to the PATCH call so the
+        "received" card body is in the same language as the original
+        prompt.  Resolving once at send time, rather than per-PATCH,
+        keeps the resolve and the PATCH in lockstep even if the user
+        changes their language setting between turns.
+        """
+        # ``tools.clarify_gateway`` is a same-package module, always
+        # importable; no defensive try/except needed (Class 6).
+        from tools.clarify_gateway import register_after_resolve
+
+        def _patch_on_resolve(choice_text: str) -> None:
+            self._submit_after_resolve_patch(
+                chat_id=chat_id,
+                message_id=message_id,
+                choice_text=choice_text,
+                lang=lang,
+            )
+
+        registered = register_after_resolve(clarify_id, _patch_on_resolve, fire_on=("text",))
+        logger.debug(
+            "[Feishu] Clarify patch hook register: clarify_id=%s message_id=%s registered=%s",
+            clarify_id,
+            message_id,
+            registered,
+        )
+
+    def _submit_after_resolve_patch(
+        self,
+        *,
+        chat_id: str,
+        message_id: str,
+        choice_text: str,
+        lang: Optional[str] = None,
+    ) -> None:
+        """Schedule the PATCH coroutine on the adapter loop.
+
+        Mirrors the approval-card pattern: builds a coroutine that performs
+        the PATCH, then submits it via ``_submit_on_loop``.  If the loop is
+        not ready yet, the PATCH is silently dropped (the agent thread has
+        already moved on, so blocking the registry is the wrong call).
+        """
+        loop = self._loop
+        if not self._loop_accepts_callbacks(loop):
+            logger.debug(
+                "[Feishu] Dropping clarify card PATCH for %s; loop not ready",
+                message_id,
+            )
+            return
+
+        async def _do_patch() -> None:
+            await self._patch_clarify_card(
+                chat_id=chat_id,
+                message_id=message_id,
+                choice_text=choice_text,
+                lang=lang,
+            )
+
+        self._submit_on_loop(loop, _do_patch())
+
+    async def _patch_clarify_card(
+        self,
+        *,
+        chat_id: str,
+        message_id: str,
+        choice_text: str,
+        lang: Optional[str] = None,
+    ) -> SendResult:
+        """PATCH the previously sent clarify card to a "received" state.
+
+        Uses ``PATCH /im/v1/messages/{message_id}`` with a shared-card
+        payload (config.update_multi: true) per the Lark Open API docs.
+        The card body shows the user's chosen text and a green "received"
+        header.
+
+        ``lang`` controls the localized strings (header + body).  Falls
+        back to the process default when ``None``.
+        """
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+        if not message_id:
+            return SendResult(success=False, error="Missing message_id")
+        try:
+            card = {
+                "config": {"wide_screen_mode": True, "update_multi": True},
+                "header": {
+                    "title": {"content": "✅ Received", "tag": "plain_text"},
+                    "template": "green",
+                },
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": f"✅ Recorded your answer: **{choice_text}**",
+                    },
+                ],
+            }
+            content = json.dumps(card, ensure_ascii=False)
+            response = await self._feishu_patch_message(
+                message_id=message_id,
+                content=content,
+            )
+            # Feishu PATCH response always carries code/msg on the response
+            # object per the Open API spec — trust the SDK to expose them.
+            code = response.code
+            msg = response.msg
+            logger.debug(
+                "[Feishu] clarify card PATCH response for %s: code=%s msg=%s choice=%r",
+                message_id, code, msg, choice_text,
+            )
+            if not self._response_succeeded(response):
+                logger.warning(
+                    "[Feishu] clarify card PATCH failed for %s: [%s] %s",
+                    message_id, code, msg,
+                )
+                return SendResult(
+                    success=False,
+                    error=f"[{code}] {msg}",
+                    raw_response=response,
+                )
+            return SendResult(success=True, message_id=message_id)
+        except Exception as exc:
+            logger.error(
+                "[Feishu] Failed to patch clarify card %s: %s",
+                message_id, exc, exc_info=True,
+            )
+            return SendResult(success=False, error=str(exc))
+
+    async def _feishu_patch_message(
+        self,
+        *,
+        message_id: str,
+        content: str,
+    ) -> Any:
+        """Send PATCH /im/v1/messages/:message_id.
+
+        Shared-card updates only.  See the Lark Open API docs:
+        https://open.larksuite.com/document_portal/v1/document/get_detail?fullPath=%2Fserver-docs%2Fim-v1%2Fmessage-card%2Fpatch
+
+        Implementation note: this path uses **raw httpx** instead of the
+        ``lark_oapi`` SDK because the SDK's ``UpdateMessageRequestBody``
+        builder drops the ``content`` field on the wire — Lark rejects the
+        resulting request with ``code=99992402 field validation failed
+        (content is required)``.  Direct httpx with the same body shape
+        used by the SDK works correctly (verified in
+        ``/im/v1/messages/{message_id}`` PATCH with body
+        ``{"content": "<card JSON string>"}`` → ``code: 0 success``).
+        """
+        if not self._client:
+            return _DummyResponse(code=99991663, msg="client not ready")
+        if httpx is None:
+            return _DummyResponse(
+                code=99991663, msg="httpx unavailable"
+            )
+        # Resolve open base URL the same way the SDK does.
+        domain = FEISHU_DOMAIN if self._domain_name != "lark" else LARK_DOMAIN
+        # Acquire tenant_access_token.  We re-fetch on every PATCH to keep
+        # this helper self-contained and avoid coupling to the SDK's
+        # internal token cache.  The token is cheap to fetch (~1 ms) and
+        # PATCHes are infrequent (per clarify-resolve).
+        try:
+            async with httpx.AsyncClient(timeout=15) as c:
+                token_resp = await c.post(
+                    f"{domain}/open-apis/auth/v3/tenant_access_token/internal",
+                    json={"app_id": self._app_id, "app_secret": self._app_secret},
+                )
+                token_data = token_resp.json()
+                access_token = token_data.get("tenant_access_token")
+                if not access_token:
+                    # Feishu's token API always returns code/msg per the Open
+                    # API spec — trust the response. int() coerces and raises
+                    # TypeError on a truly malformed response (which we WANT
+                    # to surface, not silently swallow with a magic number).
+                    return _DummyResponse(
+                        code=int(token_data["code"]),
+                        msg=f"token fetch failed: {token_data.get('msg', '')}",
+                    )
+                # PATCH the card.
+                patch_resp = await c.patch(
+                    f"{domain}/open-apis/im/v1/messages/{message_id}",
+                    json={"content": content},
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "Content-Type": "application/json; charset=utf-8",
+                    },
+                )
+                return _DummyResponse.from_dict(patch_resp.json())
+        except Exception as exc:
+            return _DummyResponse(
+                code=99991663, msg=f"PATCH exception: {exc}"
+            )
 
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
@@ -2574,6 +3191,10 @@ class FeishuAdapter(BasePlatformAdapter):
             action_value.get("hermes_update_prompt_action")
             if isinstance(action_value, dict) else None
         )
+        hermes_clarify = (
+            action_value.get("hermes_clarify")
+            if isinstance(action_value, dict) else None
+        )
 
         if hermes_action:
             return self._handle_approval_card_action(event=event, action_value=action_value, loop=loop)
@@ -2582,6 +3203,10 @@ class FeishuAdapter(BasePlatformAdapter):
                 event=event,
                 action_value=action_value,
                 loop=loop,
+            )
+        if hermes_clarify:
+            return self._handle_clarify_card_action(
+                event=event, action_value=action_value
             )
 
         self._submit_on_loop(loop, self._handle_card_action_event(data))
@@ -5245,3 +5870,42 @@ def _qr_register_inner(
         result["bot_open_id"] = None
 
     return result
+
+
+class _DummyResponse:
+    """Lightweight response shim used by ``_feishu_patch_message``.
+
+    The lark_oapi SDK normally returns an object with a ``success()``
+    method plus ``code``/``msg`` attributes.  Our raw-httpx PATCH path
+    needs to expose the same surface so the surrounding
+    ``_patch_clarify_card`` code can treat the result uniformly
+    (``self._response_succeeded(response)`` and direct ``response.code``
+    / ``response.msg`` reads).  We do NOT need to mimic the SDK's
+    ``response.succeed()`` / ``response.failed()`` helpers — only the
+    boolean + code/msg triple is read in the PATCH path.
+
+    The single source of truth for "succeeded?" is ``code == 0`` (per
+    the Lark Open API spec), so ``success`` is a derived property
+    rather than a stored field.  Callers that need the boolean should
+    go through ``success()`` (kept for SDK parity) — direct access to
+    ``code`` is the authoritative check.
+    """
+
+    __slots__ = ("code", "msg")
+
+    def __init__(self, *, code: int, msg: str) -> None:
+        self.code = code
+        self.msg = msg
+
+    def success(self) -> bool:  # noqa: D401 — SDK-parity shim method
+        return self.code == 0
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "_DummyResponse":
+        # Feishu PATCH response always carries "code"/"msg" per the Open
+        # API spec. If a malformed response arrives (missing keys), we
+        # surface code=-1 (clearly "not 0 = failure") rather than guess.
+        return cls(
+            code=int(data.get("code", -1)),
+            msg=str(data.get("msg", "")),
+        )

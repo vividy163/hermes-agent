@@ -122,6 +122,30 @@ class TestClarifyToolChoicesValidation:
         clarify_tool("Pick", choices=[1, 2, 3], callback=mock_callback)  # type: ignore
         assert choices_received == ["1", "2", "3"]
 
+    def test_long_choices_pass_through_without_truncation(self):
+        """After the 2026-06-05 removal, choices over 30 chars pass
+        through to the callback as-is (no A/B/C/D fallback, no `…`
+        truncation). The "button = choice body" simplification policy
+        (see USER.md).
+        """
+        received = {}
+
+        def mock_callback(question: str, choices: Optional[List[str]]) -> str:
+            received["question"] = question
+            received["choices"] = list(choices or [])
+            return "A"
+
+        long_choice = "これは" + "あ" * 40 + "という非常に長い選択肢の本文です"  # > 30 chars
+        clarify_tool(
+            "Which?",
+            choices=["short A", long_choice, "short C"],
+            callback=mock_callback,
+        )
+        # Question body unchanged (no choice-body append)
+        assert received["question"] == "Which?"
+        # Callback receives the original choices as-is (no truncation, no A/B/C)
+        assert received["choices"] == ["short A", long_choice, "short C"]
+
 
 class TestClarifyToolCallbackHandling:
     """Tests for callback error handling."""

@@ -4999,3 +4999,1273 @@ class TestChatLockEviction(unittest.TestCase):
                 held.release()
 
         asyncio.run(_run())
+
+
+
+class TestFeishuClarifyCard(unittest.TestCase):
+    """Verify the Feishu send_clarify override renders an interactive card
+    and that card clicks resolve through tools.clarify_gateway rather than
+    a parallel state dict."""
+
+    def _make_adapter(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = object()
+        return adapter
+
+    def _patch_adapter_loop_to_run_inline(self, adapter):
+        """Install a fresh event loop and rewire ``_submit_on_loop`` so its
+        coroutines run synchronously in the test thread.
+
+        The real production path schedules the resolve coroutine onto the
+        adapter loop from a web-framework callback thread.  For unit tests
+        we don't need that concurrency — we just need the coroutine to
+        actually run before our assertion.  This helper stores the loop on
+        the adapter and replaces ``_submit_on_loop`` with a closure that
+        captures the coroutine for the test to drive via ``run_until_complete``.
+
+        Usage:
+            loop = self._patch_adapter_loop_to_run_inline(adapter)
+            try:
+                response = asyncio.run(adapter._handle_clarify_card_action(...))
+                loop.run_until_complete(self._drain_coros(adapter))
+            finally:
+                loop.close()
+        """
+        loop = asyncio.new_event_loop()
+        pending: list = []
+
+        def _submit(_loop_arg, coro):
+            # Capture the coroutine for the test to drive; never block here.
+            pending.append(coro)
+            return True
+
+        adapter._loop = loop
+        adapter._loop_accepts_callbacks = lambda _loop: True
+        adapter._submit_on_loop = _submit
+        # Stash the queue on the instance for the test to read.
+        adapter._test_pending_coros = pending
+        return loop
+
+    def _drain_coros(self, adapter):
+        """Await everything captured by ``_submit_on_loop`` on the inline loop."""
+        async def _runner():
+            for coro in list(adapter._test_pending_coros):
+                try:
+                    await coro
+                except Exception:
+                    pass
+                adapter._test_pending_coros.remove(coro)
+        return _runner()
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_clarify_with_choices_renders_card_with_per_choice_buttons(self):
+        """When generating a choice card, render only the choice buttons —
+        do not render an "Other" button. The card config includes
+        update_multi: true so the card can be PATCHed.
+        """
+        adapter = self._make_adapter()
+        captured = {}
+
+        async def _fake_send_with_retry(*, chat_id, msg_type, payload, reply_to, metadata):
+            captured["chat_id"] = chat_id
+            captured["msg_type"] = msg_type
+            captured["payload"] = json.loads(payload)
+            return SimpleNamespace(
+                success=lambda: True,
+                data=SimpleNamespace(message_id="om_card_clarify_1"),
+            )
+
+        with patch.object(adapter, "_feishu_send_with_retry", _fake_send_with_retry):
+            result = asyncio.run(
+                adapter.send_clarify(
+                    chat_id="oc_chat_a",
+                    question="Which deploy?",
+                    choices=["canary", "stable", "rollback"],
+                    clarify_id="cltest01",
+                    session_key="feishu:oc_chat_a:user_x",
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(captured["chat_id"], "oc_chat_a")
+        self.assertEqual(captured["msg_type"], "interactive")
+        # Includes update_multi: true (PATCH-able shared card)
+        self.assertTrue(
+            captured["payload"]["config"].get("update_multi"),
+            "shared card requires update_multi: true in config",
+        )
+        # 3 choice buttons only — no "Other" button.
+        actions = [
+            el for el in captured["payload"]["elements"] if el.get("tag") == "action"
+        ]
+        self.assertEqual(len(actions), 1)
+        buttons = actions[0]["actions"]
+        self.assertEqual(len(buttons), 3)
+        # Per-choice buttons carry hermes_clarify + the literal choice string.
+        values = [b["value"] for b in buttons]
+        self.assertEqual(values[0]["choice"], "canary")
+        self.assertEqual(values[0]["clarify_id"], "cltest01")
+        self.assertTrue(values[0]["hermes_clarify"])
+        self.assertEqual(values[1]["choice"], "stable")
+        self.assertEqual(values[2]["choice"], "rollback")
+        # No "__other__" button — users reply via free text instead.
+        for btn in buttons:
+            self.assertNotEqual(btn["value"]["choice"], "__other__")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_clarify_without_choices_marks_awaiting_text(self):
+        from tools import clarify_gateway
+
+        adapter = self._make_adapter()
+        sent_payloads = []
+
+        async def _fake_send_with_retry(*, chat_id, msg_type, payload, reply_to, metadata):
+            sent_payloads.append(json.loads(payload))
+            return SimpleNamespace(
+                success=lambda: True,
+                data=SimpleNamespace(message_id="om_card_clarify_2"),
+            )
+
+        clarify_id = "cltest_open"
+        clarify_gateway.register(
+            clarify_id=clarify_id,
+            session_key="feishu:oc_chat_a:user_x",
+            question="Free text question",
+            choices=None,
+        )
+        try:
+            with patch.object(adapter, "_feishu_send_with_retry", _fake_send_with_retry):
+                result = asyncio.run(
+                    adapter.send_clarify(
+                        chat_id="oc_chat_a",
+                        question="Free text question",
+                        choices=None,
+                        clarify_id=clarify_id,
+                        session_key="feishu:oc_chat_a:user_x",
+                    )
+                )
+        finally:
+            clarify_gateway.clear_session("feishu:oc_chat_a:user_x")
+
+        self.assertTrue(result.success)
+        # No choices → no action elements (plain markdown only).
+        self.assertEqual(
+            [el for el in sent_payloads[0]["elements"] if el.get("tag") == "action"],
+            [],
+        )
+        # And the registered entry is now in text-capture mode.
+        self.assertTrue(clarify_gateway.get_pending_for_session("feishu:oc_chat_a:user_x") is None
+                        or clarify_gateway._entries.get(clarify_id) is None)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_handle_clarify_card_action_resolves_with_choice(self):
+        from tools import clarify_gateway
+
+        clarify_id = "cltest_click1"
+        clarify_gateway.register(
+            clarify_id=clarify_id,
+            session_key="feishu:oc_chat_a:user_x",
+            question="Which?",
+            choices=["a", "b"],
+        )
+        adapter = self._make_adapter()
+        loop = self._patch_adapter_loop_to_run_inline(adapter)
+        try:
+            # _handle_clarify_card_action is a sync def (matches the
+            # approval-card pattern).  Calling it via asyncio.run would
+            # return a coroutine object — same bug we just fixed in
+            # production code.
+            # ``event`` carries the clicker's open_id so the operator
+            # authorization check passes (mirrors real Feishu payloads).
+            response = adapter._handle_clarify_card_action(
+                event=SimpleNamespace(operator=SimpleNamespace(open_id="ou_test_user")),
+                action_value={
+                    "hermes_clarify": True,
+                    "clarify_id": clarify_id,
+                    "choice": "a",
+                },
+            )
+            # Drain pending work scheduled onto the inline loop.
+            loop.run_until_complete(self._drain_coros(adapter))
+        finally:
+            loop.close()
+
+        self.assertIsNotNone(response)
+        # Resolved immediately to "a".
+        # Note: resolve_gateway_clarify sets entry.response + event.set();
+        # the dict cleanup happens later inside wait_for_response.  The
+        # observable contract from the gateway side is: event is set, and
+        # the entry carries the user's chosen string.
+        entry = clarify_gateway._entries.get(clarify_id)
+        self.assertIsNotNone(entry, "registered entry should still exist after resolve")
+        self.assertTrue(entry.event.is_set(), "resolve should signal the waiting thread")
+        self.assertEqual(entry.response, "a")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_clarify_with_choices_marks_awaiting_text_immediately(self):
+        """Even when the card has choices, mark_awaiting_text is invoked
+        immediately after send. If the user replies with free text instead
+        of pressing a choice button, it is still resolved as "Other".
+        """
+        from tools import clarify_gateway
+
+        clarify_id = "cltest_immediate_mark"
+        session_key = "feishu:oc_chat_a:user_x"
+        clarify_gateway.register(
+            clarify_id=clarify_id,
+            session_key=session_key,
+            question="Which?",
+            choices=["a", "b"],
+        )
+        # Pre-condition: with choices, awaiting_text is False at register time.
+        entry = clarify_gateway._entries.get(clarify_id)
+        self.assertFalse(entry.awaiting_text)
+
+        adapter = self._make_adapter()
+
+        async def _fake_send_with_retry(*, chat_id, msg_type, payload, reply_to, metadata):
+            return SimpleNamespace(
+                success=lambda: True,
+                data=SimpleNamespace(message_id="om_card_clarify_immediate"),
+            )
+
+        try:
+            with patch.object(adapter, "_feishu_send_with_retry", _fake_send_with_retry):
+                result = asyncio.run(
+                    adapter.send_clarify(
+                        chat_id="oc_chat_a",
+                        question="Which?",
+                        choices=["a", "b"],
+                        clarify_id=clarify_id,
+                        session_key=session_key,
+                    )
+                )
+            self.assertTrue(result.success)
+            # After send_clarify, awaiting_text should be True.
+            entry = clarify_gateway._entries.get(clarify_id)
+            self.assertIsNotNone(entry)
+            self.assertTrue(
+                entry.awaiting_text,
+                "send_clarify should flip into text-capture mode immediately, "
+                "even when choices are present",
+            )
+        finally:
+            clarify_gateway.clear_session(session_key)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_clarify_returns_failure_when_client_missing(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        # _client remains None — adapter isn't connected.
+        result = asyncio.run(
+            adapter.send_clarify(
+                chat_id="oc_chat_a",
+                question="Which?",
+                choices=["a", "b"],
+                clarify_id="cltest_noclient",
+                session_key="feishu:oc_chat_a:user_x",
+            )
+        )
+        self.assertFalse(result.success)
+        self.assertIn("Not connected", result.error)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_patch_clarify_card_returns_failure_when_client_missing(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        # _client is None.
+        result = asyncio.run(
+            adapter._patch_clarify_card(
+                chat_id="oc_chat_a",
+                message_id="om_card_1",
+                choice_text="a",
+            )
+        )
+        self.assertFalse(result.success)
+        self.assertIn("Not connected", result.error)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_patch_clarify_card_sends_patch_request_with_resolved_card(self):
+        """_patch_clarify_card calls PATCH /im/v1/messages/:message_id and
+        embeds a "✅ Received" card (with update_multi: true) in the body
+        content.
+        """
+        adapter = self._make_adapter()
+        captured = {}
+
+        async def _fake_patch(message_id, content, **_):
+            captured["message_id"] = message_id
+            captured["content"] = json.loads(content)
+            # The real _feishu_patch_message returns a _DummyResponse with
+            # code/msg attributes per the Feishu PATCH Open API spec; the
+            # mock must expose the same surface so _patch_clarify_card can
+            # read response.code/msg directly without defensive getattr.
+            return SimpleNamespace(success=lambda: True, code=0, msg="success")
+
+        with patch.object(adapter, "_feishu_patch_message", _fake_patch):
+            result = asyncio.run(
+                adapter._patch_clarify_card(
+                    chat_id="oc_chat_a",
+                    message_id="om_card_clarify_1",
+                    choice_text="canary",
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(captured["message_id"], "om_card_clarify_1")
+        # Resolved card has update_multi: true (still a shared card).
+        self.assertTrue(captured["content"]["config"].get("update_multi"))
+        # Header reflects the resolved state.
+        header = captured["content"]["header"]
+        self.assertIn("Received", header["title"]["content"])
+        # Markdown element embeds the choice text.
+        elements = captured["content"]["elements"]
+        self.assertTrue(any("canary" in (e.get("content") or "") for e in elements))
+
+    def test_handle_clarify_card_action_is_sync_def_matching_approval_pattern(self):
+        """Regression test for the ``Object of type coroutine is not JSON
+        serializable`` Lark error.
+
+        Feishu's web framework dispatches card-action events synchronously
+        and treats the return value as JSON-serializable.  If
+        ``_handle_clarify_card_action`` is declared ``async def`` the
+        framework receives a coroutine object instead of a
+        ``P2CardActionTriggerResponse``, and Lark's response serializer
+        blows up.  This test guards the sync-def contract.
+        """
+        import inspect
+        from gateway.platforms.feishu import FeishuAdapter
+
+        self.assertFalse(
+            inspect.iscoroutinefunction(FeishuAdapter._handle_clarify_card_action),
+            "_handle_clarify_card_action MUST be a sync def — see Lark "
+            "error 'Object of type coroutine is not JSON serializable' "
+            "if you make it async.",
+        )
+        # And it must match the approval-card pattern.
+        self.assertFalse(
+            inspect.iscoroutinefunction(FeishuAdapter._handle_approval_card_action),
+            "_handle_approval_card_action is the reference sync-def pattern.",
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_clarify_short_choices_render_labels_as_choice_text(self):
+        """For choices with mb_strwidth < 28 the button label is still
+        the choice body itself (legacy behavior).
+        """
+        adapter = self._make_adapter()
+        captured = {}
+
+        async def _fake_send_with_retry(*, chat_id, msg_type, payload, reply_to, metadata):
+            captured["payload"] = json.loads(payload)
+            return SimpleNamespace(
+                success=lambda: True,
+                data=SimpleNamespace(message_id="om_short_1"),
+            )
+
+        # All 3 have mb_strwidth < 28: "canary" (6), "stable" (6), "rollback" (8)
+        with patch.object(adapter, "_feishu_send_with_retry", _fake_send_with_retry):
+            result = asyncio.run(
+                adapter.send_clarify(
+                    chat_id="oc_chat_a",
+                    question="Which deploy?",
+                    choices=["canary", "stable", "rollback"],
+                    clarify_id="clshort01",
+                    session_key="feishu:oc_chat_a:user_x",
+                )
+            )
+
+        self.assertTrue(result.success)
+        actions = [
+            el for el in captured["payload"]["elements"] if el.get("tag") == "action"
+        ]
+        self.assertEqual(len(actions), 1)
+        buttons = actions[0]["actions"]
+        self.assertEqual(len(buttons), 3)
+        # Button label = choice body
+        self.assertEqual(buttons[0]["text"]["content"], "canary")
+        self.assertEqual(buttons[1]["text"]["content"], "stable")
+        self.assertEqual(buttons[2]["text"]["content"], "rollback")
+        # value.choice = choice body
+        self.assertEqual(buttons[0]["value"]["choice"], "canary")
+        # Question body starts with the question and ends with the
+        # "type your own answer" hint (above the action row).  We use
+        # assertStartsWith/assertEndsWith here -- the body grew when
+        # cff1b2471 added the i18n hint, and any future hint tweak
+        # shouldn't break this test.
+        first_md = captured["payload"]["elements"][0]
+        self.assertTrue(
+            first_md["content"].startswith("❓ Which deploy?"),
+            f"unexpected question body: {first_md['content']!r}",
+        )
+        self.assertTrue(
+            first_md["content"].rstrip().endswith("(or type your own answer)"),
+            f"missing type-to-answer hint: {first_md['content']!r}",
+        )
+        # No A/B/C/D listing appended to the question body
+        self.assertNotIn("A: canary", first_md["content"])
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_clarify_kanji_over_28_triggers_abcd_fallback(self):
+        """If any choice has mb_strwidth >= 28 (14 CJK ideographs = width 28)
+        the A/B/C/D fallback is triggered.
+        """
+        adapter = self._make_adapter()
+        captured = {}
+
+        async def _fake_send_with_retry(*, chat_id, msg_type, payload, reply_to, metadata):
+            captured["payload"] = json.loads(payload)
+            return SimpleNamespace(
+                success=lambda: True,
+                data=SimpleNamespace(message_id="om_kanji_abcd_1"),
+            )
+
+        # 14 CJK ideographs = width 28 (>= 28, so fallback triggers)
+        # NOTE: CJK fixture data is intentional — it exercises the
+        # East Asian Width width calculation, not English text.
+        kanji_28 = "一二三四五六七八九十一二三四"  # 14 kanji = width 28
+        # Sanity-check the width
+        from gateway.platforms.feishu import unicodedata as _ud
+        w = sum(2 if _ud.east_asian_width(c) in ("W", "F") else 1 for c in kanji_28)
+        self.assertEqual(w, 28, f"kanji_28 has unexpected width: {w}")
+
+        with patch.object(adapter, "_feishu_send_with_retry", _fake_send_with_retry):
+            result = asyncio.run(
+                adapter.send_clarify(
+                    chat_id="oc_chat_a",
+                    question="Which?",
+                    choices=[kanji_28, "短い"],
+                    clarify_id="cl_kanji_abcd01",
+                    session_key="feishu:oc_chat_a:user_x",
+                )
+            )
+
+        self.assertTrue(result.success)
+        actions = [
+            el for el in captured["payload"]["elements"] if el.get("tag") == "action"
+        ]
+        buttons = actions[0]["actions"]
+        self.assertEqual(len(buttons), 2)
+        # Button labels = A/B/C/D
+        self.assertEqual(buttons[0]["text"]["content"], "A")
+        self.assertEqual(buttons[1]["text"]["content"], "B")
+        # value.choice = original strings (resolve path operates on full text)
+        self.assertEqual(buttons[0]["value"]["choice"], kanji_28)
+        self.assertEqual(buttons[1]["value"]["choice"], "短い")
+        # Question body lists choices in "A: <text>" form
+        first_md = captured["payload"]["elements"][0]
+        self.assertIn(f"A: {kanji_28}", first_md["content"])
+        self.assertIn("B: 短い", first_md["content"])
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_clarify_ascii_over_28_triggers_abcd_fallback(self):
+        """Even an ASCII 28-character (width 28) choice triggers the
+        A/B/C/D fallback.
+        """
+        adapter = self._make_adapter()
+        captured = {}
+
+        async def _fake_send_with_retry(*, chat_id, msg_type, payload, reply_to, metadata):
+            captured["payload"] = json.loads(payload)
+            return SimpleNamespace(
+                success=lambda: True,
+                data=SimpleNamespace(message_id="om_ascii_abcd_1"),
+            )
+
+        # ASCII 28 chars = width 28
+        ascii_28 = "A" * 28
+        with patch.object(adapter, "_feishu_send_with_retry", _fake_send_with_retry):
+            result = asyncio.run(
+                adapter.send_clarify(
+                    chat_id="oc_chat_a",
+                    question="Which?",
+                    choices=[ascii_28, "x"],
+                    clarify_id="cl_ascii_abcd01",
+                    session_key="feishu:oc_chat_a:user_x",
+                )
+            )
+
+        self.assertTrue(result.success)
+        actions = [
+            el for el in captured["payload"]["elements"] if el.get("tag") == "action"
+        ]
+        buttons = actions[0]["actions"]
+        # Button labels = A/B
+        self.assertEqual(buttons[0]["text"]["content"], "A")
+        self.assertEqual(buttons[1]["text"]["content"], "B")
+        # value.choice = original string
+        self.assertEqual(buttons[0]["value"]["choice"], ascii_28)
+        # Question body lists choices in "A: <text>" form
+        first_md = captured["payload"]["elements"][0]
+        self.assertIn(f"A: {ascii_28}", first_md["content"])
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_clarify_kanji_under_28_does_not_trigger_fallback(self):
+        """13 CJK ideographs (width 26) do NOT trigger the fallback
+        (preserves existing behavior).
+        """
+        adapter = self._make_adapter()
+        captured = {}
+
+        async def _fake_send_with_retry(*, chat_id, msg_type, payload, reply_to, metadata):
+            captured["payload"] = json.loads(payload)
+            return SimpleNamespace(
+                success=lambda: True,
+                data=SimpleNamespace(message_id="om_kanji_short_1"),
+            )
+
+        # 13 CJK ideographs = width 26
+        kanji_13 = "一二三四五六七八九十一二三"  # 13 CJK ideographs = width 26
+        from gateway.platforms.feishu import unicodedata as _ud
+        w = sum(2 if _ud.east_asian_width(c) in ("W", "F") else 1 for c in kanji_13)
+        self.assertEqual(w, 26, f"kanji_13 has unexpected width: {w}")
+
+        with patch.object(adapter, "_feishu_send_with_retry", _fake_send_with_retry):
+            result = asyncio.run(
+                adapter.send_clarify(
+                    chat_id="oc_chat_a",
+                    question="Which?",
+                    choices=[kanji_13, "x"],
+                    clarify_id="cl_kanji_under01",
+                    session_key="feishu:oc_chat_a:user_x",
+                )
+            )
+
+        self.assertTrue(result.success)
+        actions = [
+            el for el in captured["payload"]["elements"] if el.get("tag") == "action"
+        ]
+        buttons = actions[0]["actions"]
+        # Button labels = choice bodies (no fallback)
+        self.assertEqual(buttons[0]["text"]["content"], kanji_13)
+        self.assertEqual(buttons[1]["text"]["content"], "x")
+        # No "A: " form appended to the question body
+        first_md = captured["payload"]["elements"][0]
+        self.assertNotIn("A: ", first_md["content"])
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_clarify_mixed_width_long_choice_triggers_fallback(self):
+        """Mixed (CJK ideograph + ASCII) choice with mb_strwidth >= 28
+        also triggers the fallback.
+        """
+        adapter = self._make_adapter()
+        captured = {}
+
+        async def _fake_send_with_retry(*, chat_id, msg_type, payload, reply_to, metadata):
+            captured["payload"] = json.loads(payload)
+            return SimpleNamespace(
+                success=lambda: True,
+                data=SimpleNamespace(message_id="om_mixed_1"),
+            )
+
+        # 12 CJK ideographs (width 24) + 5 ASCII (width 5) = width 29 (>= 28)
+        mixed_29 = "一二三四五六七八九十一二" + "abcde"
+        from gateway.platforms.feishu import unicodedata as _ud
+        w = sum(2 if _ud.east_asian_width(c) in ("W", "F") else 1 for c in mixed_29)
+        self.assertEqual(w, 29, f"mixed_29 has unexpected width: {w}")
+
+        with patch.object(adapter, "_feishu_send_with_retry", _fake_send_with_retry):
+            result = asyncio.run(
+                adapter.send_clarify(
+                    chat_id="oc_chat_a",
+                    question="Which?",
+                    choices=[mixed_29, "短い"],
+                    clarify_id="cl_mixed01",
+                    session_key="feishu:oc_chat_a:user_x",
+                )
+            )
+
+        self.assertTrue(result.success)
+        actions = [
+            el for el in captured["payload"]["elements"] if el.get("tag") == "action"
+        ]
+        buttons = actions[0]["actions"]
+        # Fallback triggered
+        self.assertEqual(buttons[0]["text"]["content"], "A")
+        self.assertEqual(buttons[1]["text"]["content"], "B")
+        # value.choice = original string
+        self.assertEqual(buttons[0]["value"]["choice"], mixed_29)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_clarify_abcd_resolve_preserves_full_choice_text(self):
+        """When an A/B/C/D button is pressed, the resolved value preserves
+        the full text (value.choice). This is an intentional exception to
+        the Class 2 pitfall (text.content != value.choice).
+        """
+        adapter = self._make_adapter()
+        from tools import clarify_gateway
+
+        # Inline-ize the adapter loop (resolve coroutine runs in the test thread)
+        loop = self._patch_adapter_loop_to_run_inline(adapter)
+
+        clarify_id = "cl_abcd_resolve01"
+        long_choice = "一二三四五六七八九十一二三四"  # 14 CJK ideographs = width 28
+        # Register on the gateway side
+        clarify_gateway.register(
+            clarify_id=clarify_id,
+            session_key="feishu:oc_chat_a:user_x",
+            question="Which?",
+            choices=[long_choice, "短い選択肢"],  # width 28 and short
+        )
+
+        # Send the card
+        captured = {}
+
+        async def _fake_send_with_retry(*, chat_id, msg_type, payload, reply_to, metadata):
+            captured["payload"] = json.loads(payload)
+            return SimpleNamespace(
+                success=lambda: True,
+                data=SimpleNamespace(message_id="om_resolve_test"),
+            )
+
+        with patch.object(adapter, "_feishu_send_with_retry", _fake_send_with_retry):
+            result = asyncio.run(
+                adapter.send_clarify(
+                    chat_id="oc_chat_a",
+                    question="Which?",
+                    choices=[long_choice, "短い選択肢"],
+                    clarify_id=clarify_id,
+                    session_key="feishu:oc_chat_a:user_x",
+                )
+            )
+
+        self.assertTrue(result.success)
+        # Confirm the buttons are A/B
+        actions = [
+            el for el in captured["payload"]["elements"] if el.get("tag") == "action"
+        ]
+        buttons = actions[0]["actions"]
+        self.assertEqual(buttons[0]["text"]["content"], "A")
+        self.assertEqual(buttons[0]["value"]["choice"], long_choice)
+
+        # Simulate pressing the A button's value to resolve
+        action_value = {
+            "hermes_clarify": True,
+            "clarify_id": clarify_id,
+            "choice": long_choice,  # via value.choice
+        }
+        try:
+            # ``event`` carries the clicker's open_id so the operator
+            # authorization check passes (mirrors real Feishu payloads).
+            response = adapter._handle_clarify_card_action(
+                event=SimpleNamespace(operator=SimpleNamespace(open_id="ou_test_user")),
+                action_value=action_value,
+            )
+            # drain pending coros
+            async def _drain():
+                for coro in list(adapter._test_pending_coros):
+                    try:
+                        await coro
+                    except Exception:
+                        pass
+                    adapter._test_pending_coros.remove(coro)
+            loop.run_until_complete(_drain())
+        finally:
+            loop.close()
+
+        # Verify entry.response is the full text after resolve
+        entry = clarify_gateway._entries.get(clarify_id)
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.response, long_choice, "resolve value should preserve the full text")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_clarify_dict_value_key_extracted_in_l3(self):
+        """L2 (clarify_tool) does not normalize dict choices, so at L3
+        (feishu.py::send_clarify) we extract the body from
+        ``{"value": ...}`` shapes. Button label = extracted value;
+        value.choice = extracted value.
+        """
+        adapter = self._make_adapter()
+        captured = {}
+
+        async def _fake_send_with_retry(*, chat_id, msg_type, payload, reply_to, metadata):
+            captured["payload"] = json.loads(payload)
+            return SimpleNamespace(
+                success=lambda: True,
+                data=SimpleNamespace(message_id="om_dict_v_1"),
+            )
+
+        # Case where MCP/LLM pass choices in dict form ({"value": "1"})
+        with patch.object(adapter, "_feishu_send_with_retry", _fake_send_with_retry):
+            result = asyncio.run(
+                adapter.send_clarify(
+                    chat_id="oc_chat_a",
+                    question="Which?",
+                    choices=[{"value": "1"}, {"value": "2"}, {"value": "3"}],
+                    clarify_id="cl_dict_v01",
+                    session_key="feishu:oc_chat_a:user_x",
+                )
+            )
+
+        self.assertTrue(result.success)
+        actions = [
+            el for el in captured["payload"]["elements"] if el.get("tag") == "action"
+        ]
+        buttons = actions[0]["actions"]
+        # Button label = extracted value
+        self.assertEqual(buttons[0]["text"]["content"], "1")
+        self.assertEqual(buttons[1]["text"]["content"], "2")
+        self.assertEqual(buttons[2]["text"]["content"], "3")
+        # value.choice = extracted value (resolve path returns the full text)
+        self.assertEqual(buttons[0]["value"]["choice"], "1")
+        # Question body starts with the question and ends with the
+        # type-to-answer hint.  Only the dict extraction matters in
+        # this test; the hint tail is incidental.
+        first_md = captured["payload"]["elements"][0]
+        self.assertTrue(
+            first_md["content"].startswith("❓ Which?"),
+            f"unexpected question body: {first_md['content']!r}",
+        )
+        # No dict repr leaked
+        for b in buttons:
+            self.assertNotIn("{'value'", b["text"]["content"])
+            self.assertNotIn("{'value'", b["value"]["choice"])
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_clarify_dict_label_key_fallback_in_l3(self):
+        """The ``.label`` key is also accepted (``.value`` takes priority)."""
+        adapter = self._make_adapter()
+        captured = {}
+
+        async def _fake_send_with_retry(*, chat_id, msg_type, payload, reply_to, metadata):
+            captured["payload"] = json.loads(payload)
+            return SimpleNamespace(
+                success=lambda: True,
+                data=SimpleNamespace(message_id="om_dict_l_1"),
+            )
+
+        with patch.object(adapter, "_feishu_send_with_retry", _fake_send_with_retry):
+            result = asyncio.run(
+                adapter.send_clarify(
+                    chat_id="oc_chat_a",
+                    question="Which?",
+                    choices=[{"label": "Alpha"}, {"label": "Beta"}],
+                    clarify_id="cl_dict_l01",
+                    session_key="feishu:oc_chat_a:user_x",
+                )
+            )
+
+        self.assertTrue(result.success)
+        actions = [
+            el for el in captured["payload"]["elements"] if el.get("tag") == "action"
+        ]
+        buttons = actions[0]["actions"]
+        self.assertEqual(buttons[0]["text"]["content"], "Alpha")
+        self.assertEqual(buttons[1]["text"]["content"], "Beta")
+        self.assertEqual(buttons[0]["value"]["choice"], "Alpha")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_clarify_mixed_string_and_dict_in_l3(self):
+        """Mixed string and dict choices are all normalized to strings (L3)."""
+        adapter = self._make_adapter()
+        captured = {}
+
+        async def _fake_send_with_retry(*, chat_id, msg_type, payload, reply_to, metadata):
+            captured["payload"] = json.loads(payload)
+            return SimpleNamespace(
+                success=lambda: True,
+                data=SimpleNamespace(message_id="om_mixed_dict_1"),
+            )
+
+        with patch.object(adapter, "_feishu_send_with_retry", _fake_send_with_retry):
+            result = asyncio.run(
+                adapter.send_clarify(
+                    chat_id="oc_chat_a",
+                    question="Which?",
+                    choices=["plain", {"value": "from-obj"}, {"label": "from-label"}],
+                    clarify_id="cl_mixed_dict01",
+                    session_key="feishu:oc_chat_a:user_x",
+                )
+            )
+
+        self.assertTrue(result.success)
+        actions = [
+            el for el in captured["payload"]["elements"] if el.get("tag") == "action"
+        ]
+        buttons = actions[0]["actions"]
+        self.assertEqual(buttons[0]["text"]["content"], "plain")
+        self.assertEqual(buttons[1]["text"]["content"], "from-obj")
+        self.assertEqual(buttons[2]["text"]["content"], "from-label")
+        # value.choice is also all strings
+        self.assertEqual(buttons[0]["value"]["choice"], "plain")
+        self.assertEqual(buttons[1]["value"]["choice"], "from-obj")
+        self.assertEqual(buttons[2]["value"]["choice"], "from-label")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_clarify_dict_with_empty_value_yields_empty_button_label(self):
+        """An empty dict like ``{"value": ""}`` is extracted to an empty
+        string at L3 and does NOT leak the dict's Python repr
+        (``"{'value': ''}"``) into the resolve path.
+
+        The fallback returns ``""`` rather than ``str(c)``. The Feishu
+        client accepts the dict repr as a button label, so the same repr
+        would come back through the resolve path and break the agent.
+        Returning empty aligns the button label and value.choice to "" so
+        dict-repr leaks are reliably prevented.
+
+        The correct fix is to drop empty dicts at L2 (clarify_tool), but
+        we also defend against dict-repr leaks at the L3 wire boundary
+        (defense in depth).
+        """
+        adapter = self._make_adapter()
+        captured = {}
+
+        async def _fake_send_with_retry(*, chat_id, msg_type, payload, reply_to, metadata):
+            captured["payload"] = json.loads(payload)
+            return SimpleNamespace(
+                success=lambda: True,
+                data=SimpleNamespace(message_id="om_empty_dict_1"),
+            )
+
+        with patch.object(adapter, "_feishu_send_with_retry", _fake_send_with_retry):
+            result = asyncio.run(
+                adapter.send_clarify(
+                    chat_id="oc_chat_a",
+                    question="Which?",
+                    choices=[{"value": ""}, {"value": "ok"}],
+                    clarify_id="cl_empty_dict01",
+                    session_key="feishu:oc_chat_a:user_x",
+                )
+            )
+
+        self.assertTrue(result.success)
+        actions = [el for el in captured["payload"]["elements"] if el.get("tag") == "action"]
+        buttons = actions[0]["actions"]
+        # Empty dict → empty button label (NOT the dict repr)
+        self.assertEqual(buttons[0]["text"]["content"], "")
+        self.assertEqual(buttons[0]["value"]["choice"], "")
+        # Normal dict → extracted value
+        self.assertEqual(buttons[1]["text"]["content"], "ok")
+        self.assertEqual(buttons[1]["value"]["choice"], "ok")
+        # No dict repr leaked (anywhere)
+        for b in buttons:
+            for field in ("text", "value"):
+                payload = b[field]["content"] if field == "text" else b[field]["choice"]
+                self.assertNotIn("{", payload)
+                self.assertNotIn("}", payload)
+
+
+class TestFeishuClarifyButtonClickAfterResolve(unittest.TestCase):
+    """Adapter-level tests for the click-ack / PATCH hook race fix.
+
+    The Feishu PATCH hook is registered with ``fire_on=("text",)`` so
+    it only fires on typed-text resolves.  Button clicks update the
+    card in place via the ``P2CardActionTriggerResponse`` and must NOT
+    also fire a PATCH (which would double-update the message).
+    See ``feishu-clarify-card-debugging`` SKILL (race-condition class).
+    """
+
+    def setUp(self):
+        # Clean module state so other tests can't leak into ours.
+        from tools import clarify_gateway
+        clarify_gateway._after_resolve_cbs.clear()
+        clarify_gateway._entries.clear()
+        clarify_gateway._session_index.clear()
+
+    def tearDown(self):
+        from tools import clarify_gateway
+        clarify_gateway._after_resolve_cbs.clear()
+        clarify_gateway._entries.clear()
+        clarify_gateway._session_index.clear()
+
+    def _make_adapter(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = object()
+        # Empty admin lists so any open_id passes authorization by default
+        # (we want to test the click-ack and PATCH race independently of
+        # authorization).  Authorization is exercised in
+        # test_handle_clarify_card_action_unauthorized_click_is_rejected.
+        adapter._admins = set()
+        adapter._allowed_group_users = set()
+        # Inline-ize the adapter loop so synchronous resolve coroutines
+        # actually run in the test thread (mirrors the
+        # _patch_adapter_loop_to_run_inline pattern in TestFeishuClarifyCard).
+        import asyncio
+        loop = asyncio.new_event_loop()
+        pending: list = []
+
+        def _submit(_loop_arg, coro):
+            pending.append(coro)
+            return True
+
+        adapter._loop = loop
+        adapter._loop_accepts_callbacks = lambda _loop: True
+        adapter._submit_on_loop = _submit
+        adapter._test_pending_coros = pending
+        return adapter
+
+    def _drain_coros(self, adapter):
+        """Run all pending coros scheduled by ``_submit_on_loop`` to completion."""
+        import asyncio
+        async def _drain():
+            for coro in list(adapter._test_pending_coros):
+                try:
+                    await coro
+                except Exception:
+                    pass
+                adapter._test_pending_coros.remove(coro)
+        loop = adapter._loop
+        loop.run_until_complete(_drain())
+
+    def _send_clarify(self, adapter, *, clarify_id: str) -> str:
+        """Drive ``send_clarify`` and return the registered message_id.
+
+        Pre-registers the clarify entry in the gateway primitive so the
+        adapter's ``_register_clarify_card_patch_hook`` call can
+        successfully attach to it (the agent thread normally does this
+        registration; in tests we own it).
+        """
+        from tools import clarify_gateway
+
+        # The agent-thread side normally registers the entry first;
+        # do the same here.
+        clarify_gateway.register(
+            clarify_id=clarify_id,
+            session_key="feishu:oc_chat_a:user_x",
+            question="Which?",
+            choices=["a", "b"],
+        )
+        captured: dict = {}
+
+        async def _fake_send_with_retry(*, chat_id, msg_type, payload, reply_to, metadata):
+            captured["payload"] = json.loads(payload)
+            return SimpleNamespace(
+                success=lambda: True,
+                data=SimpleNamespace(message_id="om_test_message_id"),
+            )
+
+        with patch.object(adapter, "_feishu_send_with_retry", _fake_send_with_retry):
+            result = asyncio.run(
+                adapter.send_clarify(
+                    chat_id="oc_chat_a",
+                    question="Which?",
+                    choices=["a", "b"],
+                    clarify_id=clarify_id,
+                    session_key="feishu:oc_chat_a:user_x",
+                )
+            )
+        self.assertTrue(result.success)
+        return "om_test_message_id"
+
+    def test_button_click_does_not_fire_patch_hook(self):
+        """The PATCH hook (registered with fire_on=("text",)) must NOT
+        fire when the user resolves via button click.  Otherwise the
+        click-ack and the PATCH would race, double-updating the card.
+        """
+        from tools import clarify_gateway
+
+        adapter = self._make_adapter()
+        clarify_id = "cl_btn_no_patch01"
+        # ``_send_clarify`` pre-registers the clarify entry.
+        self._send_clarify(adapter, clarify_id=clarify_id)
+
+        # Verify the PATCH hook is registered.
+        self.assertIn(clarify_id, clarify_gateway._after_resolve_cbs)
+        callback, fire_on = clarify_gateway._after_resolve_cbs[clarify_id]
+        self.assertEqual(fire_on, ("text",), "PATCH hook should be text-only")
+
+        # Replace the registered hook so we can observe whether it fires
+        # (the real callback would call _patch_clarify_card → httpx).
+        patch_calls: list = []
+
+        def _patch_hook(_text: str) -> None:
+            patch_calls.append(_text)
+
+        clarify_gateway._after_resolve_cbs[clarify_id] = (_patch_hook, ("text",))
+
+        # Click the "a" button.
+        adapter._handle_clarify_card_action(
+            event=SimpleNamespace(operator=SimpleNamespace(open_id="ou_test_user")),
+            action_value={
+                "hermes_clarify": True,
+                "clarify_id": clarify_id,
+                "choice": "a",
+            },
+        )
+        # Drain the inline loop so the resolve coroutine actually runs
+        # (otherwise the entry isn't even resolved yet and our assertion
+        # about hook firing would be trivially true).
+        self._drain_coros(adapter)
+        # The hook was text-only; it should NOT have fired.
+        self.assertEqual(
+            patch_calls, [],
+            "button click must not fire the text-only PATCH hook",
+        )
+
+    def test_text_resolve_fires_patch_hook(self):
+        """A typed-text resolve (source='text') MUST fire the PATCH hook
+        so the card gets a "received" indicator in chat history.
+        """
+        from tools import clarify_gateway
+
+        adapter = self._make_adapter()
+        clarify_id = "cl_text_fires_patch01"
+        # ``_send_clarify`` pre-registers the clarify entry.
+        self._send_clarify(adapter, clarify_id=clarify_id)
+
+        patch_calls: list = []
+
+        def _patch_hook(choice_text: str) -> None:
+            patch_calls.append(choice_text)
+
+        # Swap the registered hook so we observe firing.
+        clarify_gateway._after_resolve_cbs[clarify_id] = (_patch_hook, ("text",))
+
+        # Simulate the text-intercept path calling resolve with source="text".
+        resolved = clarify_gateway.resolve_gateway_clarify(
+            clarify_id, "a", source="text",
+        )
+        self.assertTrue(resolved)
+        # The text-only hook DID fire.
+        self.assertEqual(
+            patch_calls, ["a"],
+            "text resolve should fire the text-only PATCH hook",
+        )
+
+    def test_handle_clarify_card_action_unauthorized_click_is_rejected(self):
+        """A button click from an unauthorized operator is rejected
+        (mirrors the approval / update-prompt authorization pattern).
+        """
+        from tools import clarify_gateway
+
+        adapter = self._make_adapter()
+        # Restrict the allowed list to a specific user; "ou_other" must be rejected.
+        adapter._admins = {"ou_admin"}
+        adapter._allowed_group_users = set()
+
+        clarify_id = "cl_unauth01"
+        clarify_gateway.register(
+            clarify_id=clarify_id,
+            session_key="feishu:oc_chat_a:user_x",
+            question="Which?",
+            choices=["a", "b"],
+        )
+
+        # Click from a non-admin user.
+        response = adapter._handle_clarify_card_action(
+            event=SimpleNamespace(operator=SimpleNamespace(open_id="ou_other")),
+            action_value={
+                "hermes_clarify": True,
+                "clarify_id": clarify_id,
+                "choice": "a",
+            },
+        )
+        # An empty P2CardActionTriggerResponse (or None) is returned for
+        # the rejected case — the entry must NOT have resolved.
+        entry = clarify_gateway._entries.get(clarify_id)
+        if entry is not None:
+            self.assertFalse(
+                entry.event.is_set(),
+                "unauthorized click must NOT signal the waiting thread",
+            )
+        # The exact response type is allowed to be None or an empty
+        # P2CardActionTriggerResponse — both signal "ignore".  We just
+        # assert it didn't raise and didn't resolve.
+
+    def test_handle_clarify_card_action_authorized_click_resolves(self):
+        """Symmetric: an authorized operator's click DOES resolve."""
+        from tools import clarify_gateway
+
+        adapter = self._make_adapter()
+        adapter._admins = {"ou_admin"}
+        adapter._allowed_group_users = set()
+
+        clarify_id = "cl_auth01"
+        clarify_gateway.register(
+            clarify_id=clarify_id,
+            session_key="feishu:oc_chat_a:user_x",
+            question="Which?",
+            choices=["a", "b"],
+        )
+
+        adapter._handle_clarify_card_action(
+            event=SimpleNamespace(operator=SimpleNamespace(open_id="ou_admin")),
+            action_value={
+                "hermes_clarify": True,
+                "clarify_id": clarify_id,
+                "choice": "a",
+            },
+        )
+        # The resolve coroutine is scheduled onto the inline loop —
+        # drain it so the entry's event gets set.
+        self._drain_coros(adapter)
+        entry = clarify_gateway._entries.get(clarify_id)
+        self.assertIsNotNone(entry)
+        self.assertTrue(entry.event.is_set(), "authorized click should signal the thread")
+        self.assertEqual(entry.response, "a")
+
+    def test_wildcard_authorization_allows_any_operator(self):
+        """An ``_allowed_group_users`` of ``["*"]`` (wildcard) lets any
+        user click — same rule as the approval / update-prompt paths.
+        """
+        from tools import clarify_gateway
+
+        adapter = self._make_adapter()
+        adapter._admins = set()
+        adapter._allowed_group_users = {"*"}
+
+        clarify_id = "cl_wildcard01"
+        clarify_gateway.register(
+            clarify_id=clarify_id,
+            session_key="feishu:oc_chat_a:user_x",
+            question="Which?",
+            choices=["a"],
+        )
+
+        adapter._handle_clarify_card_action(
+            event=SimpleNamespace(operator=SimpleNamespace(open_id="ou_random")),
+            action_value={
+                "hermes_clarify": True,
+                "clarify_id": clarify_id,
+                "choice": "a",
+            },
+        )
+        self._drain_coros(adapter)
+        entry = clarify_gateway._entries.get(clarify_id)
+        self.assertTrue(entry.event.is_set(), "wildcard should let any click through")
+
+
+class TestFeishuClarifyTypeToAnswerHint(unittest.TestCase):
+    """The "type your own answer" hint lives in the question body, not
+    on a separate "✏️ Other" button.
+
+    Rationale: the Feishu mobile client caps inline buttons at ~28
+    mb_strwidth and we already use up the 4-button column slot for
+    choices; adding a 5th button risks fold/wrap breakage.  So the
+    hint rides directly above the action row in the question body.
+    See the in-code comment in send_clarify for the full reasoning.
+    """
+
+    def setUp(self):
+        from tools import clarify_gateway
+        clarify_gateway._after_resolve_cbs.clear()
+        clarify_gateway._entries.clear()
+        clarify_gateway._session_index.clear()
+
+    def tearDown(self):
+        from tools import clarify_gateway
+        clarify_gateway._after_resolve_cbs.clear()
+        clarify_gateway._entries.clear()
+        clarify_gateway._session_index.clear()
+
+    def _make_adapter(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = object()
+        adapter._admins = set()
+        adapter._allowed_group_users = set()
+        return adapter
+
+    def _send_capture_payload(self, adapter, *, clarify_id: str, choices, metadata=None):
+        from tools import clarify_gateway
+        clarify_gateway.register(
+            clarify_id=clarify_id,
+            session_key="feishu:oc_chat_a:user_x",
+            question="pick one",
+            choices=choices,
+        )
+        captured: dict = {}
+
+        async def _fake_send_with_retry(*, chat_id, msg_type, payload, reply_to, metadata):
+            captured["payload"] = json.loads(payload)
+            return SimpleNamespace(
+                success=lambda: True,
+                data=SimpleNamespace(message_id="om_hint_test"),
+            )
+
+        with patch.object(adapter, "_feishu_send_with_retry", _fake_send_with_retry):
+            result = asyncio.run(
+                adapter.send_clarify(
+                    chat_id="oc_chat_a",
+                    question="pick one",
+                    choices=choices,
+                    clarify_id=clarify_id,
+                    session_key="feishu:oc_chat_a:user_x",
+                    metadata=metadata,
+                )
+            )
+        self.assertTrue(result.success)
+        return captured
+
+    def _first_markdown(self, payload):
+        return next(
+            el for el in payload["elements"] if el.get("tag") == "markdown"
+        )
+
+    def test_hint_appears_with_choices(self):
+        adapter = self._make_adapter()
+        captured = self._send_capture_payload(
+            adapter, clarify_id="cl_hint_with_choices",
+            choices=["a", "b"],
+        )
+        body = self._first_markdown(captured["payload"])["content"]
+        # English catalog value
+        self.assertIn("type your own answer", body)
+        # Hint is at the END of the body (above the action row, which
+        # Feishu renders separately below the markdown elements).
+        self.assertTrue(body.rstrip().endswith("(or type your own answer)"))
+
+    def test_hint_appears_for_open_ended(self):
+        """Even with no choices, the hint is shown so the user knows a
+        free-text reply is the way to answer."""
+        adapter = self._make_adapter()
+        captured = self._send_capture_payload(
+            adapter, clarify_id="cl_hint_open_ended", choices=None,
+        )
+        body = self._first_markdown(captured["payload"])["content"]
+        self.assertIn("type your own answer", body)
+        # No buttons rendered for open-ended.
+        actions = [
+            el for el in captured["payload"]["elements"] if el.get("tag") == "action"
+        ]
+        self.assertEqual(actions, [])
+
+    def test_hint_appears_with_abcd_fallback(self):
+        """When a long choice triggers the A/B/C/D label collapse, the
+        hint rides under the ``A: <text>`` listing -- the same place
+        the per-choice listing ends."""
+        adapter = self._make_adapter()
+        long_choice = "これは" + "あ" * 40 + "という非常に長い選択肢の本文です"
+        captured = self._send_capture_payload(
+            adapter, clarify_id="cl_hint_abcd",
+            choices=[long_choice, "short"],
+        )
+        body = self._first_markdown(captured["payload"])["content"]
+        # The A: <text> listing is present.
+        self.assertIn("A: ", body)
+        # Hint still rides at the end, below the listing.
+        self.assertIn("type your own answer", body)
+        self.assertGreater(
+            body.index("type your own answer"),
+            body.index("A: "),
+            "hint should come AFTER the per-choice listing",
+        )
+
+    def test_no_other_button_is_rendered(self):
+        """The hint is text-only; the action row contains only choice
+        buttons (no ✏️ Other / Other / freeform button)."""
+        adapter = self._make_adapter()
+        captured = self._send_capture_payload(
+            adapter, clarify_id="cl_hint_no_other",
+            choices=["a", "b", "c"],
+        )
+        actions = [
+            el for el in captured["payload"]["elements"] if el.get("tag") == "action"
+        ]
+        self.assertEqual(len(actions), 1, "exactly one action row")
+        buttons = actions[0]["actions"]
+        # One button per choice -- no extra "Other" button.
+        self.assertEqual(len(buttons), 3)
+        for btn in buttons:
+            self.assertNotEqual(btn["text"]["content"], "Other")
+            self.assertNotIn("Other", btn["text"]["content"])
+            self.assertNotIn("✏️", btn["text"]["content"])
