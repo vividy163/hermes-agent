@@ -5117,6 +5117,7 @@ class TestFeishuClarifyCard(unittest.TestCase):
     @patch.dict(os.environ, {}, clear=True)
     def test_send_clarify_without_choices_marks_awaiting_text(self):
         from tools import clarify_gateway
+        from gateway.platforms import feishu
 
         adapter = self._make_adapter()
         sent_payloads = []
@@ -5162,6 +5163,7 @@ class TestFeishuClarifyCard(unittest.TestCase):
     @patch.dict(os.environ, {}, clear=True)
     def test_handle_clarify_card_action_resolves_with_choice(self):
         from tools import clarify_gateway
+        from gateway.platforms import feishu
 
         clarify_id = "cltest_click1"
         clarify_gateway.register(
@@ -5210,6 +5212,7 @@ class TestFeishuClarifyCard(unittest.TestCase):
         of pressing a choice button, it is still resolved as "Other".
         """
         from tools import clarify_gateway
+        from gateway.platforms import feishu
 
         clarify_id = "cltest_immediate_mark"
         session_key = "feishu:oc_chat_a:user_x"
@@ -5600,6 +5603,7 @@ class TestFeishuClarifyCard(unittest.TestCase):
         """
         adapter = self._make_adapter()
         from tools import clarify_gateway
+        from gateway.platforms import feishu
 
         # Inline-ize the adapter loop (resolve coroutine runs in the test thread)
         loop = self._patch_adapter_loop_to_run_inline(adapter)
@@ -5864,13 +5868,15 @@ class TestFeishuClarifyButtonClickAfterResolve(unittest.TestCase):
     def setUp(self):
         # Clean module state so other tests can't leak into ours.
         from tools import clarify_gateway
-        clarify_gateway._after_resolve_cbs.clear()
+        from gateway.platforms import feishu
+        feishu._feishu_after_resolve_cbs.clear()
         clarify_gateway._entries.clear()
         clarify_gateway._session_index.clear()
 
     def tearDown(self):
         from tools import clarify_gateway
-        clarify_gateway._after_resolve_cbs.clear()
+        from gateway.platforms import feishu
+        feishu._feishu_after_resolve_cbs.clear()
         clarify_gateway._entries.clear()
         clarify_gateway._session_index.clear()
 
@@ -5924,6 +5930,7 @@ class TestFeishuClarifyButtonClickAfterResolve(unittest.TestCase):
         registration; in tests we own it).
         """
         from tools import clarify_gateway
+        from gateway.platforms import feishu
 
         # The agent-thread side normally registers the entry first;
         # do the same here.
@@ -5961,6 +5968,7 @@ class TestFeishuClarifyButtonClickAfterResolve(unittest.TestCase):
         click-ack and the PATCH would race, double-updating the card.
         """
         from tools import clarify_gateway
+        from gateway.platforms import feishu
 
         adapter = self._make_adapter()
         clarify_id = "cl_btn_no_patch01"
@@ -5968,9 +5976,9 @@ class TestFeishuClarifyButtonClickAfterResolve(unittest.TestCase):
         self._send_clarify(adapter, clarify_id=clarify_id)
 
         # Verify the PATCH hook is registered.
-        self.assertIn(clarify_id, clarify_gateway._after_resolve_cbs)
-        callback, fire_on = clarify_gateway._after_resolve_cbs[clarify_id]
-        self.assertEqual(fire_on, ("text",), "PATCH hook should be text-only")
+        self.assertIn(clarify_id, feishu._feishu_after_resolve_cbs)
+        # The hook itself is opaque to the test; the button path is
+        # not allowed to call _feishu_fire_after_resolve_hook.
 
         # Replace the registered hook so we can observe whether it fires
         # (the real callback would call _patch_clarify_card → httpx).
@@ -5979,7 +5987,7 @@ class TestFeishuClarifyButtonClickAfterResolve(unittest.TestCase):
         def _patch_hook(_text: str) -> None:
             patch_calls.append(_text)
 
-        clarify_gateway._after_resolve_cbs[clarify_id] = (_patch_hook, ("text",))
+        feishu._feishu_register_after_resolve_hook(clarify_id, _patch_hook)
 
         # Click the "a" button.
         adapter._handle_clarify_card_action(
@@ -6005,6 +6013,7 @@ class TestFeishuClarifyButtonClickAfterResolve(unittest.TestCase):
         so the card gets a "received" indicator in chat history.
         """
         from tools import clarify_gateway
+        from gateway.platforms import feishu
 
         adapter = self._make_adapter()
         clarify_id = "cl_text_fires_patch01"
@@ -6017,13 +6026,19 @@ class TestFeishuClarifyButtonClickAfterResolve(unittest.TestCase):
             patch_calls.append(choice_text)
 
         # Swap the registered hook so we observe firing.
-        clarify_gateway._after_resolve_cbs[clarify_id] = (_patch_hook, ("text",))
+        feishu._feishu_register_after_resolve_hook(clarify_id, _patch_hook)
 
-        # Simulate the text-intercept path calling resolve with source="text".
+        # Simulate the text-intercept path calling resolve.  In the
+        # real gateway runner, the resolve and the Feishu hook fire are
+        # two separate steps: resolve_gateway_clarify() unblocks the
+        # agent thread, then the runner notices the active adapter is
+        # Feishu and calls _feishu_fire_after_resolve_hook() to PATCH
+        # the card.  This test exercises both.
         resolved = clarify_gateway.resolve_gateway_clarify(
-            clarify_id, "a", source="text",
+            clarify_id, "a",
         )
         self.assertTrue(resolved)
+        feishu._feishu_fire_after_resolve_hook(clarify_id, "a")
         # The text-only hook DID fire.
         self.assertEqual(
             patch_calls, ["a"],
@@ -6035,6 +6050,7 @@ class TestFeishuClarifyButtonClickAfterResolve(unittest.TestCase):
         (mirrors the approval / update-prompt authorization pattern).
         """
         from tools import clarify_gateway
+        from gateway.platforms import feishu
 
         adapter = self._make_adapter()
         # Restrict the allowed list to a specific user; "ou_other" must be rejected.
@@ -6073,6 +6089,7 @@ class TestFeishuClarifyButtonClickAfterResolve(unittest.TestCase):
     def test_handle_clarify_card_action_authorized_click_resolves(self):
         """Symmetric: an authorized operator's click DOES resolve."""
         from tools import clarify_gateway
+        from gateway.platforms import feishu
 
         adapter = self._make_adapter()
         adapter._admins = {"ou_admin"}
@@ -6107,6 +6124,7 @@ class TestFeishuClarifyButtonClickAfterResolve(unittest.TestCase):
         user click — same rule as the approval / update-prompt paths.
         """
         from tools import clarify_gateway
+        from gateway.platforms import feishu
 
         adapter = self._make_adapter()
         adapter._admins = set()
@@ -6146,13 +6164,15 @@ class TestFeishuClarifyTypeToAnswerHint(unittest.TestCase):
 
     def setUp(self):
         from tools import clarify_gateway
-        clarify_gateway._after_resolve_cbs.clear()
+        from gateway.platforms import feishu
+        feishu._feishu_after_resolve_cbs.clear()
         clarify_gateway._entries.clear()
         clarify_gateway._session_index.clear()
 
     def tearDown(self):
         from tools import clarify_gateway
-        clarify_gateway._after_resolve_cbs.clear()
+        from gateway.platforms import feishu
+        feishu._feishu_after_resolve_cbs.clear()
         clarify_gateway._entries.clear()
         clarify_gateway._session_index.clear()
 
@@ -6167,6 +6187,7 @@ class TestFeishuClarifyTypeToAnswerHint(unittest.TestCase):
 
     def _send_capture_payload(self, adapter, *, clarify_id: str, choices, metadata=None):
         from tools import clarify_gateway
+        from gateway.platforms import feishu
         clarify_gateway.register(
             clarify_id=clarify_id,
             session_key="feishu:oc_chat_a:user_x",

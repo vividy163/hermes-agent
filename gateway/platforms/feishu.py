@@ -66,7 +66,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Literal, Optional, Sequence
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -132,6 +132,75 @@ except ImportError:
 
 FEISHU_WEBSOCKET_AVAILABLE = websockets is not None
 FEISHU_WEBHOOK_AVAILABLE = aiohttp is not None
+
+
+# =========================================================================
+# Feishu-specific "PATCH the sent card to 'received' state on typed reply"
+# helpers.  These used to live in tools/clarify_gateway as a cross-platform
+# register_after_resolve / _fire_after_resolve pair, but only Feishu needs
+# them: Telegram edits the message at click time and never needs a
+# text-path PATCH, and the TUI never goes through the gateway.  Keeping
+# the hook machinery inside feishu.py is a smaller surface for a feature
+# that only this adapter uses.
+#
+# The hook is one-shot per clarify_id: the text-intercept path
+# (FeishuAdapter._maybe_intercept_clarify_text in the gateway runner) calls
+# _feishu_fire_after_resolve_hook after a typed reply resolves, and the
+# hook PATCHes the previously-sent card to the "received" state.  The
+# button path skips the hook because the click-ack response already
+# updated the card in place via P2CardActionTriggerResponse.
+_feishu_after_resolve_cbs: Dict[str, Callable[[str], None]] = {}
+_feishu_after_resolve_lock = threading.Lock()
+
+
+def _feishu_register_after_resolve_hook(
+    clarify_id: str,
+    callback: Callable[[str], None],
+) -> bool:
+    """Register a one-shot callback fired after ``clarify_id`` resolves.
+
+    Feishu-specific.  Returns True if registered, False if the entry
+    already vanished (rare race with timeout/clear_session).
+    """
+    from tools import clarify_gateway
+
+    with clarify_gateway._lock:
+        if clarify_gateway._entries.get(clarify_id) is None:
+            return False
+    with _feishu_after_resolve_lock:
+        _feishu_after_resolve_cbs[clarify_id] = callback
+    return True
+
+
+def _feishu_fire_after_resolve_hook(clarify_id: str, choice_text: str) -> None:
+    """Pop and invoke the registered Feishu PATCH hook.
+
+    Called only from the text-reply path; the button path's click-ack
+    already updated the card.  Errors are swallowed (logged) so a buggy
+    adapter hook can never block the agent thread.
+    """
+    with _feishu_after_resolve_lock:
+        callback = _feishu_after_resolve_cbs.pop(clarify_id, None)
+    if callback is None:
+        return
+    try:
+        callback(choice_text)
+    except Exception:
+        logger.warning(
+            "[feishu] after_resolve hook for %s raised; swallowed",
+            clarify_id,
+            exc_info=True,
+        )
+
+
+def _feishu_clear_after_resolve_hook(clarify_id: str) -> None:
+    """Drop a registered hook without invoking it.  Used when the
+    gateway's clear_session path drops a clarify before the user
+    answered.
+    """
+    with _feishu_after_resolve_lock:
+        _feishu_after_resolve_cbs.pop(clarify_id, None)
+
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -2271,10 +2340,10 @@ class FeishuAdapter(BasePlatformAdapter):
             from tools.clarify_gateway import resolve_gateway_clarify
 
             # No "__other__" branch: there is no Other button anymore.  The
-            # text-intercept path handles free-form text replies.  ``source="button"``
-            # tells the registry to skip ``fire_on=("text",)`` hooks (the Feishu
-            # PATCH hook) — the click-ack below already updated the card in place.
-            resolved = resolve_gateway_clarify(clarify_id, str(choice), source="button")
+            # text-intercept path handles free-form text replies.  Button
+            # path skips the Feishu PATCH hook because the click-ack
+            # below already updated the card in place.
+            resolved = resolve_gateway_clarify(clarify_id, str(choice))
             if not resolved:
                 logger.debug(
                     "[Feishu] Clarify %s already resolved or unknown", clarify_id,
@@ -2332,7 +2401,6 @@ class FeishuAdapter(BasePlatformAdapter):
         """
         # ``tools.clarify_gateway`` is a same-package module, always
         # importable; no defensive try/except needed (Class 6).
-        from tools.clarify_gateway import register_after_resolve
 
         def _patch_on_resolve(choice_text: str) -> None:
             self._submit_after_resolve_patch(
@@ -2342,7 +2410,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 lang=lang,
             )
 
-        registered = register_after_resolve(clarify_id, _patch_on_resolve, fire_on=("text",))
+        registered = _feishu_register_after_resolve_hook(clarify_id, _patch_on_resolve)
         logger.debug(
             "[Feishu] Clarify patch hook register: clarify_id=%s message_id=%s registered=%s",
             clarify_id,
