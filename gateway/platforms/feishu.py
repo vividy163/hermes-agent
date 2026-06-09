@@ -2086,33 +2086,6 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.warning("[Feishu] send_clarify failed: %s", exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
-    @staticmethod
-    def _build_resolved_clarify_card(*, choice: str, lang: Optional[str] = None) -> Dict[str, Any]:
-        """Build raw card JSON showing the selected choice (closes the buttons).
-
-        Returned to the card action callback so Feishu replaces the
-        buttons with this resolved view in the same message.  Marked as
-        a shared card (``update_multi: true``) for consistency with the
-        PATCH-based resolve path.
-
-        ``lang`` controls the localized strings (header + body).  Falls
-        back to the process default when ``None`` -- same convention as
-        the other t() callsites in this file.
-        """
-        return {
-            "config": {"wide_screen_mode": True, "update_multi": True},
-            "header": {
-                "title": {"content": "✅ Selected", "tag": "plain_text"},
-                "template": "green",
-            },
-            "elements": [
-                {
-                    "tag": "markdown",
-                    "content": f"✅ You selected **{choice}**",
-                },
-            ],
-        }
-
     def _handle_clarify_card_action(
         self, *, event: Any, action_value: Dict[str, Any]
     ) -> Any:
@@ -2126,11 +2099,7 @@ class FeishuAdapter(BasePlatformAdapter):
         card body so Feishu replaces the buttons in place.
         """
         clarify_id = action_value.get("clarify_id")
-        choice = action_value.get("choice", "")
-        chat_id = (
-            str(getattr(event, "chat_id", "") or "")
-            or str(getattr(getattr(event, "context", None), "chat_id", "") or "")
-        )
+        choice = str(action_value.get("choice", ""))
         if not clarify_id:
             logger.debug("[Feishu] Clarify card action missing clarify_id, ignoring")
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
@@ -2150,18 +2119,15 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.warning("[Feishu] Dropping clarify action before adapter loop is ready")
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
 
+        chat_id = (
+            str(getattr(event, "chat_id", "") or "")
+            or str(getattr(getattr(event, "context", None), "chat_id", "") or "")
+        )
+
         async def _resolve() -> None:
             from tools.clarify_gateway import resolve_gateway_clarify
-
-            resolved = resolve_gateway_clarify(clarify_id, str(choice))
-            if resolved:
-                # Drop the card message_id so a subsequent text reply
-                # in the same chat does not PATCH the resolved card.
+            if resolve_gateway_clarify(clarify_id, choice):
                 self._clarify_card_message_ids.pop(chat_id, None)
-            else:
-                logger.debug(
-                    "[Feishu] Clarify %s already resolved or unknown", clarify_id,
-                )
 
         self._submit_on_loop(loop, _resolve())
 
@@ -2170,7 +2136,16 @@ class FeishuAdapter(BasePlatformAdapter):
         response = P2CardActionTriggerResponse()
         card = CallBackCard()
         card.type = "raw"
-        card.data = self._build_resolved_clarify_card(choice=str(choice))
+        card.data = {
+            "config": {"wide_screen_mode": True, "update_multi": True},
+            "header": {
+                "title": {"content": "✅ Selected", "tag": "plain_text"},
+                "template": "green",
+            },
+            "elements": [
+                {"tag": "markdown", "content": f"✅ You selected **{choice}**"},
+            ],
+        }
         response.card = card
         return response
 
