@@ -1961,15 +1961,7 @@ class FeishuAdapter(BasePlatformAdapter):
         ]
 
         if choices:
-            # L2 (clarify_tool) does not normalize dict choices, so we
-            # extract the ``{"value": ...}`` form to a string here
-            # (the Feishu client accepts dict repr as a button label,
-            # so we defend inside the Feishu adapter only).
-            # Other platforms reject at the API layer so this is unnecessary there.
             choices = [FeishuAdapter._extract_choice_text(c) for c in choices]
-            # Feishu caps action buttons per row; keep ≤4 choices per row.
-            # We use one column per button for a clean vertical stack.
-            # If any choice exceeds 28, trigger the A/B/C/D fallback.
             use_abcd = any(
                 FeishuAdapter._display_width(c) >= FeishuAdapter._FEISHU_BUTTON_SAFE_WIDTH
                 for c in choices
@@ -1988,10 +1980,6 @@ class FeishuAdapter(BasePlatformAdapter):
                     ),
                 }
             else:
-                # Short labels: question body is just the question +
-                # the type-to-answer hint.  No per-choice listing in
-                # the body since the buttons themselves show the
-                # full label.
                 elements[0] = {
                     "tag": "markdown",
                     "content": (
