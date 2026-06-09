@@ -5371,7 +5371,7 @@ class TestFeishuClarifyCard(unittest.TestCase):
             f"unexpected question body: {first_md['content']!r}",
         )
         self.assertTrue(
-            first_md["content"].rstrip().endswith("(or type your own answer)"),
+            first_md["content"].rstrip().endswith("(or send a message for other options)"),
             f"missing type-to-answer hint: {first_md['content']!r}",
         )
         # No A/B/C/D listing appended to the question body

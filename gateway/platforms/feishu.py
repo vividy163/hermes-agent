@@ -1908,6 +1908,143 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.error("[Feishu] Failed to edit message %s: %s", message_id, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
+    @staticmethod
+    def _display_width(s: str) -> int:
+        """PHP's mb_strwidth equivalent (East Asian Width based, full-width=2 / half-width=1)."""
+        w = 0
+        for c in s:
+            if unicodedata.east_asian_width(c) in ("W", "F"):
+                w += 2
+            else:
+                w += 1
+        return w
+
+    @staticmethod
+    def _extract_choice_text(c: Any) -> str:
+        """Extract a string body from a choice the LLM may pass in
+        dict form (``{"value": "1"}``) instead of the schema's flat
+        string list.  Priority: .value > .label > .text.  Returns
+        ``""`` (NOT ``str(c)``) on no match — the dict repr would
+        otherwise leak into the resolve path.
+        """
+        if isinstance(c, dict):
+            extracted = c.get("value")
+            if extracted in (None, ""):
+                extracted = c.get("label")
+            if extracted in (None, ""):
+                extracted = c.get("text")
+            return extracted or ""
+        if c is None:
+            return ""
+        return str(c)
+
+    _FEISHU_BUTTON_SAFE_WIDTH = 28
+    _BUTTON_LABELS = ("A", "B", "C", "D")
+
+    @staticmethod
+    def _build_clarify_card(
+        *,
+        question: str,
+        choices: Optional[list],
+        clarify_id: str,
+    ) -> Dict[str, Any]:
+        """Build the interactive card JSON for a clarify prompt.
+
+        The card is a shared card (config.update_multi: true).  When
+        choices is non-empty, render one button per choice (no "Other"
+        button — the user replies with free text via text-capture, which
+        the gateway's text-intercept path resolves).  When choices is
+        empty/None, render the question as plain markdown text and the
+        next text message resolves the clarify.  The type-to-answer hint
+        is shown directly above the action row so the user knows they
+        can also type a free-form reply.
+        """
+        # Sits directly above the action button row; never below it
+        # (Feishu renders the action block at the bottom of the card
+        # with no trailing whitespace, so anything appended after
+        # would be clipped).
+        type_to_answer_hint = "(or send a message for other options)"
+
+        elements: List[Dict[str, Any]] = [
+            {"tag": "markdown", "content": f"❓ {question}"},
+        ]
+
+        if choices:
+            # L2 (clarify_tool) does not normalize dict choices, so we
+            # extract the ``{"value": ...}`` form to a string here
+            # (the Feishu client accepts dict repr as a button label,
+            # so we defend inside the Feishu adapter only).
+            # Other platforms reject at the API layer so this is unnecessary there.
+            choices = [FeishuAdapter._extract_choice_text(c) for c in choices]
+            # Feishu caps action buttons per row; keep ≤4 choices per row.
+            # We use one column per button for a clean vertical stack.
+            # If any choice exceeds 28, trigger the A/B/C/D fallback.
+            use_abcd = any(
+                FeishuAdapter._display_width(c) >= FeishuAdapter._FEISHU_BUTTON_SAFE_WIDTH
+                for c in choices
+            )
+            buttons: List[Dict[str, Any]] = []
+            if use_abcd:
+                # List all choice bodies in the question body as "A: <text>" form
+                choices_listing = "\n".join(
+                    f"{FeishuAdapter._BUTTON_LABELS[i]}: {c}"
+                    for i, c in enumerate(choices)
+                )
+                elements[0] = {
+                    "tag": "markdown",
+                    "content": (
+                        f"❓ {question}\n\n{choices_listing}\n\n{type_to_answer_hint}"
+                    ),
+                }
+            else:
+                # Short labels: question body is just the question +
+                # the type-to-answer hint.  No per-choice listing in
+                # the body since the buttons themselves show the
+                # full label.
+                elements[0] = {
+                    "tag": "markdown",
+                    "content": (
+                        f"❓ {question}\n\n{type_to_answer_hint}"
+                    ),
+                }
+            for idx, choice in enumerate(choices):
+                label = FeishuAdapter._extract_choice_text(choice) or f"Option {idx + 1}"
+                if use_abcd:
+                    label = FeishuAdapter._BUTTON_LABELS[idx]
+                else:
+                    label = choice
+                buttons.append({
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": label},
+                    "type": "default",
+                    "value": {
+                        "hermes_clarify": True,
+                        "clarify_id": clarify_id,
+                        "choice": choice,
+                    },
+                })
+            # No "Other" button — the user just replies with free text.
+            # awaiting_text is flipped below so the next text message
+            # is captured by the gateway text-intercept.
+            elements.append({"tag": "action", "actions": buttons})
+        else:
+            # No choices (open-ended): the question is the whole
+            # body.  Append the type-to-answer hint so the user
+            # knows the response is just a free-text reply.
+            elements[0] = {
+                "tag": "markdown",
+                "content": f"❓ {question}\n\n{type_to_answer_hint}",
+            }
+
+        return {
+            "config": {"wide_screen_mode": True, "update_multi": True},
+            "header": {
+                "title": {"content": "🤔 Please select", "tag": "plain_text"},
+                "template": "blue",
+            },
+            "elements": elements,
+        }
+
     async def send_clarify(
         self,
         chat_id: str,
@@ -1931,133 +2068,9 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
-            # Collapse button labels to A/B/C/D when any choice exceeds
-            # the Feishu mobile client's 28-mb_strwidth limit, expand
-            # full text in the question body.  value.choice keeps the
-            # original string so the resolve path is preserved.
-            def _display_width(s: str) -> int:
-                """PHP's mb_strwidth equivalent (East Asian Width based, full-width=2 / half-width=1)."""
-                w = 0
-                for c in s:
-                    if unicodedata.east_asian_width(c) in ("W", "F"):
-                        w += 2
-                    else:
-                        w += 1
-                return w
-
-            def _extract_choice_text(c: Any) -> str:
-                """Extract a string body from a choice the LLM may pass in
-                dict form (``{"value": "1"}``) instead of the schema's flat
-                string list.  Priority: .value > .label > .text.  Returns
-                ``""`` (NOT ``str(c)``) on no match — the dict repr would
-                otherwise leak into the resolve path.
-                """
-                if isinstance(c, dict):
-                    extracted = c.get("value")
-                    if extracted in (None, ""):
-                        extracted = c.get("label")
-                    if extracted in (None, ""):
-                        extracted = c.get("text")
-                    return extracted or ""
-                if c is None:
-                    return ""
-                return str(c)
-
-            _FEISHU_BUTTON_SAFE_WIDTH = 28
-            _BUTTON_LABELS = ("A", "B", "C", "D")
-
-            # Resolve the "type your own answer" hint once.  The
-            # Feishu card has no "✏️ Other" button (mobile client
-            # width + 4-button column cap), so the user is told in
-            # the question body to type their answer instead.  The
-            # hint sits directly above the action button row, never
-            # below it (Feishu renders the action block at the bottom
-            # of the card with no trailing whitespace, so anything
-            # appended after would be clipped).
-            type_to_answer_hint = "(or type your own answer)"
-
-            elements: List[Dict[str, Any]] = [
-                {"tag": "markdown", "content": f"❓ {question}"},
-            ]
-
-            if choices:
-                # L2 (clarify_tool) does not normalize dict choices, so we
-                # extract the ``{"value": ...}`` form to a string here
-                # (the Feishu client accepts dict repr as a button label,
-                # so we defend inside the Feishu adapter only).
-                # Other platforms reject at the API layer so this is unnecessary there.
-                choices = [_extract_choice_text(c) for c in choices]
-                # Feishu caps action buttons per row; keep ≤4 choices per row.
-                # We use one column per button for a clean vertical stack.
-                # If any choice exceeds 28, trigger the A/B/C/D fallback.
-                use_abcd = any(
-                    _display_width(c) >= _FEISHU_BUTTON_SAFE_WIDTH
-                    for c in choices
-                )
-                buttons: List[Dict[str, Any]] = []
-                if use_abcd:
-                    # List all choice bodies in the question body as "A: <text>" form
-                    choices_listing = "\n".join(
-                        f"{_BUTTON_LABELS[i]}: {c}"
-                        for i, c in enumerate(choices)
-                    )
-                    elements[0] = {
-                        "tag": "markdown",
-                        "content": (
-                            f"❓ {question}\n\n{choices_listing}\n\n{type_to_answer_hint}"
-                        ),
-                    }
-                else:
-                    # Short labels: question body is just the question +
-                    # the type-to-answer hint.  No per-choice listing in
-                    # the body since the buttons themselves show the
-                    # full label.
-                    elements[0] = {
-                        "tag": "markdown",
-                        "content": (
-                            f"❓ {question}\n\n{type_to_answer_hint}"
-                        ),
-                    }
-                for idx, choice in enumerate(choices):
-                    label = _extract_choice_text(choice) or f"Option {idx + 1}"
-                    if use_abcd:
-                        label = _BUTTON_LABELS[idx]
-                    else:
-                        label = choice
-                    buttons.append({
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": label},
-                        "type": "default",
-                        "value": {
-                            "hermes_clarify": True,
-                            "clarify_id": clarify_id,
-                            "choice": choice,
-                        },
-                    })
-                # No "Other" button — the user just replies with free text.
-                # awaiting_text is flipped below so the next text message
-                # is captured by the gateway text-intercept.
-                elements.append({"tag": "action", "actions": buttons})
-            else:
-                # No choices (open-ended): the question is the whole
-                # body.  Append the type-to-answer hint so the user
-                # knows the response is just a free-text reply.
-                elements[0] = {
-                    "tag": "markdown",
-                    "content": f"❓ {question}\n\n{type_to_answer_hint}",
-                }
-                # No buttons to append; the next inbound text message
-                # resolves via the gateway text-intercept.
-                pass  # handled after the send completes successfully
-
-            card: Dict[str, Any] = {
-                "config": {"wide_screen_mode": True, "update_multi": True},
-                "header": {
-                    "title": {"content": "🤔 Please select", "tag": "plain_text"},
-                    "template": "blue",
-                },
-                "elements": elements,
-            }
+            card = self._build_clarify_card(
+                question=question, choices=choices, clarify_id=clarify_id,
+            )
             payload = json.dumps(card, ensure_ascii=False)
 
             response = await self._feishu_send_with_retry(
@@ -2071,8 +2084,6 @@ class FeishuAdapter(BasePlatformAdapter):
             if not result.success:
                 logger.warning("[Feishu] send_clarify send failed: %s", result.error)
                 return SendResult(success=False, error=result.error)
-            # Feishu's CreateMessage response always carries data.message_id
-            # on success per the Open API spec — trust the SDK to expose it.
             message_id = result.message_id
             from tools.clarify_gateway import mark_awaiting_text
             mark_awaiting_text(clarify_id)
@@ -2136,7 +2147,14 @@ class FeishuAdapter(BasePlatformAdapter):
         response = P2CardActionTriggerResponse()
         card = CallBackCard()
         card.type = "raw"
-        card.data = {
+        card.data = self._build_resolved_clarify_card(choice=choice)
+        response.card = card
+        return response
+
+    @staticmethod
+    def _build_resolved_clarify_card(*, choice: str) -> Dict[str, Any]:
+        """Build raw card JSON showing the selected choice (closes the buttons)."""
+        return {
             "config": {"wide_screen_mode": True, "update_multi": True},
             "header": {
                 "title": {"content": "✅ Selected", "tag": "plain_text"},
@@ -2146,8 +2164,6 @@ class FeishuAdapter(BasePlatformAdapter):
                 {"tag": "markdown", "content": f"✅ You selected **{choice}**"},
             ],
         }
-        response.card = card
-        return response
 
     async def _patch_clarify_card(
         self,
