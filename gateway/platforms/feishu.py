@@ -2003,13 +2003,8 @@ class FeishuAdapter(BasePlatformAdapter):
                     },
                 })
             # No "Other" button — the user just replies with free text.
-            # awaiting_text is flipped below so the next text message
-            # is captured by the gateway text-intercept.
             elements.append({"tag": "action", "actions": buttons})
         else:
-            # No choices (open-ended): the question is the whole
-            # body.  Append the type-to-answer hint so the user
-            # knows the response is just a free-text reply.
             elements[0] = {
                 "tag": "markdown",
                 "content": f"❓ {question}\n\n{type_to_answer_hint}",
