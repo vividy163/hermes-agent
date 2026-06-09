@@ -150,10 +150,6 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
 def resolve_gateway_clarify(clarify_id: str, response: str) -> bool:
     """Unblock the agent thread waiting on ``clarify_id``.
 
-    Args:
-        clarify_id: The pending entry to resolve.
-        response: The user's chosen text (or free-form reply).
-
     Returns True if an entry was found and resolved, False otherwise
     (already resolved, expired, or never existed).
     """
