@@ -7655,29 +7655,6 @@ class GatewayRunner:
                         "Gateway intercepted clarify text response (session=%s, id=%s)",
                         _quick_key, _pending_clarify.clarify_id,
                     )
-                    # If the active adapter is Feishu, fire its
-                    # after-resolve hook so the previously sent card gets
-                    # PATCHed to the "received" state.  Other adapters
-                    # either don't expose this hook (Telegram updates
-                    # the message at click time) or route through their
-                    # own mechanism.
-                    _active_adapter = self.adapters.get(source.platform)
-                    if _active_adapter and _active_adapter.__class__.__name__ == "FeishuAdapter":
-                        try:
-                            from gateway.platforms.feishu import (
-                                _feishu_fire_after_resolve_hook,
-                            )
-                            _feishu_fire_after_resolve_hook(
-                                _pending_clarify.clarify_id, _raw_clarify_reply,
-                            )
-                        except Exception:
-                            logger.debug(
-                                "[gateway] Feishu after-resolve hook failed",
-                                exc_info=True,
-                            )
-                    # Acknowledge with empty string so adapters that emit
-                    # the agent's response don't double-post.  The agent
-                    # itself will produce the next user-facing message.
                     return ""
 
         # Intercept messages that are responses to a pending /reload-mcp

@@ -49,6 +49,7 @@ def make_adapter_skeleton(
     adapter._allowed_group_users = frozenset()
     adapter._allow_bots = allow_bots
     adapter._require_mention = require_mention
+    adapter._clarify_card_message_ids = {}
     return adapter
 
 
