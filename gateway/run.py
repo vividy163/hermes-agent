@@ -7655,6 +7655,9 @@ class GatewayRunner:
                         "Gateway intercepted clarify text response (session=%s, id=%s)",
                         _quick_key, _pending_clarify.clarify_id,
                     )
+                    # Acknowledge with empty string so adapters that emit
+                    # the agent's response don't double-post.  The agent
+                    # itself will produce the next user-facing message.
                     return ""
 
         # Intercept messages that are responses to a pending /reload-mcp
