@@ -2165,6 +2165,37 @@ class FeishuAdapter(BasePlatformAdapter):
             ],
         }
 
+    async def _fetch_tenant_access_token(self, *, domain: str) -> Optional[str]:
+        """Fetch a tenant access token from the Feishu auth endpoint.
+
+        Returns the token string, or None on failure.  Used by the
+        card-PATCH path which talks to Feishu directly via httpx
+        rather than going through the SDK.
+        """
+        if httpx is None:
+            logger.error("[Feishu] httpx unavailable; cannot fetch access token")
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=15) as c:
+                token_resp = await c.post(
+                    f"{domain}/open-apis/auth/v3/tenant_access_token/internal",
+                    json={"app_id": self._app_id, "app_secret": self._app_secret},
+                )
+                token_data = token_resp.json()
+                access_token = token_data.get("tenant_access_token")
+                if not access_token:
+                    logger.warning(
+                        "[Feishu] access token fetch failed: [%s] %s",
+                        token_data.get("code"),
+                        token_data.get("msg", ""),
+                    )
+                return access_token
+        except Exception as exc:
+            logger.error(
+                "[Feishu] access token fetch raised: %s", exc, exc_info=True,
+            )
+            return None
+
     async def _patch_clarify_card(
         self,
         *,
@@ -2198,18 +2229,10 @@ class FeishuAdapter(BasePlatformAdapter):
 
         domain = FEISHU_DOMAIN if self._domain_name != "lark" else LARK_DOMAIN
         try:
+            access_token = await self._fetch_tenant_access_token(domain=domain)
+            if not access_token:
+                return SendResult(success=False, error="Failed to fetch access token")
             async with httpx.AsyncClient(timeout=15) as c:
-                token_resp = await c.post(
-                    f"{domain}/open-apis/auth/v3/tenant_access_token/internal",
-                    json={"app_id": self._app_id, "app_secret": self._app_secret},
-                )
-                token_data = token_resp.json()
-                access_token = token_data.get("tenant_access_token")
-                if not access_token:
-                    return SendResult(
-                        success=False,
-                        error=f"[{token_data['code']}] token fetch failed: {token_data.get('msg', '')}",
-                    )
                 patch_resp = await c.patch(
                     f"{domain}/open-apis/im/v1/messages/{message_id}",
                     json={"content": content},
