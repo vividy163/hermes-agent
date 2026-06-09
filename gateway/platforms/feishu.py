@@ -880,9 +880,6 @@ def normalize_feishu_message(
         return _normalize_interactive_message(normalized_type, payload)
     if normalized_type == "location":
         # Feishu `location` payload: {"name": str, "longitude": str, "latitude": str}.
-        # Surface a human-readable line to the agent AND a structured metadata
-        # entry so downstream skills (find-nearby / maps / hotel_search) can
-        # consume coordinates without re-parsing text.
         name = str(payload.get("name", "") or "").strip()
         latitude = str(payload.get("latitude", "") or "").strip()
         longitude = str(payload.get("longitude", "") or "").strip()
@@ -1512,8 +1509,6 @@ class FeishuAdapter(BasePlatformAdapter):
         self._update_prompt_state: Dict[int, Dict[str, str]] = {}
         self._update_prompt_counter = itertools.count(1)
         # chat_id → message_id of the most recently sent clarify card.
-        # Popped on text reply (see _handle_message_event_data) so the
-        # entry is consumed once.  New clarifies overwrite.
         self._clarify_card_message_ids: Dict[str, str] = {}
         # Feishu reaction deletion requires the opaque reaction_id returned
         # by create, so we cache it per message_id.
@@ -1959,10 +1954,6 @@ class FeishuAdapter(BasePlatformAdapter):
         is shown directly above the action row so the user knows they
         can also type a free-form reply.
         """
-        # Sits directly above the action button row; never below it
-        # (Feishu renders the action block at the bottom of the card
-        # with no trailing whitespace, so anything appended after
-        # would be clipped).
         type_to_answer_hint = "(or send a message for other options)"
 
         elements: List[Dict[str, Any]] = [
@@ -2204,7 +2195,6 @@ class FeishuAdapter(BasePlatformAdapter):
         choice_text: str,
         lang: Optional[str] = None,
     ) -> SendResult:
-        """PATCH the previously sent clarify card to a "received" state."""
         if not self._client:
             return SendResult(success=False, error="Not connected")
         if not message_id:
@@ -2249,8 +2239,6 @@ class FeishuAdapter(BasePlatformAdapter):
             )
             return SendResult(success=False, error=str(exc))
 
-        # Feishu PATCH response always carries code/msg per the Open API
-        # spec — trust the SDK to expose them.
         code = response.code
         msg = response.msg
         logger.debug(
@@ -2854,7 +2842,6 @@ class FeishuAdapter(BasePlatformAdapter):
         return chat_id in self._clarify_card_message_ids
 
     def _fire_clarify_card_patch(self, message: Any) -> None:
-        """PATCH the previously sent card to "received" state."""
         chat_id = str(getattr(message, "chat_id", "") or "")
         message_id = self._clarify_card_message_ids.pop(chat_id, None)
         if not message_id:
@@ -5697,9 +5684,6 @@ class _DummyResponse:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "_DummyResponse":
-        # Feishu PATCH response always carries "code"/"msg" per the Open
-        # API spec. If a malformed response arrives (missing keys), we
-        # surface code=-1 (clearly "not 0 = failure") rather than guess.
         return cls(
             code=int(data.get("code", -1)),
             msg=str(data.get("msg", "")),

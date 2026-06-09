@@ -5362,9 +5362,8 @@ class TestFeishuClarifyCard(unittest.TestCase):
         self.assertEqual(buttons[0]["value"]["choice"], "canary")
         # Question body starts with the question and ends with the
         # "type your own answer" hint (above the action row).  We use
-        # assertStartsWith/assertEndsWith here -- the body grew when
-        # cff1b2471 added the i18n hint, and any future hint tweak
-        # shouldn't break this test.
+        # assertStartsWith/assertEndsWith here so the test doesn't break
+        # when the hint wording is tweaked.
         first_md = captured["payload"]["elements"][0]
         self.assertTrue(
             first_md["content"].startswith("❓ Which deploy?"),
