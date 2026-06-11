@@ -104,6 +104,8 @@ try:
         GetMessageRequest,
         GetMessageResourceRequest,
         P2ImMessageMessageReadV1,
+        PatchMessageRequest,
+        PatchMessageRequestBody,
         ReplyMessageRequest,
         ReplyMessageRequestBody,
         UpdateMessageRequest,
@@ -1945,78 +1947,74 @@ class FeishuAdapter(BasePlatformAdapter):
     ) -> Dict[str, Any]:
         """Build the interactive card JSON for a clarify prompt.
 
-        The card is a shared card (config.update_multi: true).  When
-        choices is non-empty, render one button per choice (no "Other"
-        button — the user replies with free text via text-capture, which
-        the gateway's text-intercept path resolves).  When choices is
-        empty/None, render the question as plain markdown text and the
-        next text message resolves the clarify.  The type-to-answer hint
-        is shown directly above the action row so the user knows they
-        can also type a free-form reply.
+        The card is a shared card (config.update_multi: true).  Buttons
+        collapse to A/B/C/D when any choice body would exceed the Feishu
+        mobile client's 28-mb_strwidth label cap; in that branch the
+        full bodies are listed in the question area as "A: <text>" so
+        the user can still see what each letter maps to.
         """
         type_to_answer_hint = "(or send a message for other options)"
+        header = {
+            "title": {"content": "🤔 Please select", "tag": "plain_text"},
+            "template": "blue",
+        }
+        config = {"wide_screen_mode": True, "update_multi": True}
 
-        elements: List[Dict[str, Any]] = [
-            {"tag": "markdown", "content": f"❓ {question}"},
-        ]
-
-        if choices:
-            choices = [FeishuAdapter._extract_choice_text(c) for c in choices]
-            use_abcd = any(
-                FeishuAdapter._display_width(c) >= FeishuAdapter._FEISHU_BUTTON_SAFE_WIDTH
-                for c in choices
-            )
-            buttons: List[Dict[str, Any]] = []
-            if use_abcd:
-                # List all choice bodies in the question body as "A: <text>" form
-                choices_listing = "\n".join(
-                    f"{FeishuAdapter._BUTTON_LABELS[i]}: {c}"
-                    for i, c in enumerate(choices)
-                )
-                elements[0] = {
-                    "tag": "markdown",
-                    "content": (
-                        f"❓ {question}\n\n{choices_listing}\n\n{type_to_answer_hint}"
-                    ),
-                }
-            else:
-                elements[0] = {
-                    "tag": "markdown",
-                    "content": (
-                        f"❓ {question}\n\n{type_to_answer_hint}"
-                    ),
-                }
-            for idx, choice in enumerate(choices):
-                label = FeishuAdapter._extract_choice_text(choice) or f"Option {idx + 1}"
-                if use_abcd:
-                    label = FeishuAdapter._BUTTON_LABELS[idx]
-                else:
-                    label = choice
-                buttons.append({
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": label},
-                    "type": "default",
-                    "value": {
-                        "hermes_clarify": True,
-                        "clarify_id": clarify_id,
-                        "choice": choice,
-                    },
-                })
-            # No "Other" button — the user just replies with free text.
-            elements.append({"tag": "action", "actions": buttons})
-        else:
-            elements[0] = {
-                "tag": "markdown",
-                "content": f"❓ {question}\n\n{type_to_answer_hint}",
+        if not choices:
+            return {
+                "config": config,
+                "header": header,
+                "elements": [
+                    {"tag": "markdown", "content": f"❓ {question}\n\n{type_to_answer_hint}"},
+                ],
             }
 
+        choices = [FeishuAdapter._extract_choice_text(c) for c in choices]
+        use_abcd = any(
+            FeishuAdapter._display_width(c) >= FeishuAdapter._FEISHU_BUTTON_SAFE_WIDTH
+            for c in choices
+        )
+        choices_listing = (
+            "\n".join(
+                f"{FeishuAdapter._BUTTON_LABELS[i]}: {c}"
+                for i, c in enumerate(choices)
+            )
+            if use_abcd else ""
+        )
+        body = f"❓ {question}\n\n{choices_listing}\n\n{type_to_answer_hint}"
+        if not use_abcd:
+            body = body.rstrip()  # no listing → drop the trailing newlines
+
+        buttons: List[Dict[str, Any]] = []
+        for idx, choice in enumerate(choices):
+            # Choice is already a string at this point (L1964 normalizes
+            # dict-form choices to "" via _extract_choice_text).  In
+            # use_abcd mode we replace it with the A/B/C/D label; in the
+            # short-label mode we keep the original string (which may be
+            # "" for {"value": ""} dicts — the test pins that behavior).
+            label = FeishuAdapter._extract_choice_text(choice) or f"Option {idx + 1}"
+            if use_abcd:
+                label = FeishuAdapter._BUTTON_LABELS[idx]
+            else:
+                label = choice
+            buttons.append({
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": label},
+                "type": "default",
+                "value": {
+                    "hermes_clarify": True,
+                    "clarify_id": clarify_id,
+                    "choice": choice,
+                },
+            })
+
         return {
-            "config": {"wide_screen_mode": True, "update_multi": True},
-            "header": {
-                "title": {"content": "🤔 Please select", "tag": "plain_text"},
-                "template": "blue",
-            },
-            "elements": elements,
+            "config": config,
+            "header": header,
+            "elements": [
+                {"tag": "markdown", "content": body},
+                {"tag": "action", "actions": buttons},
+            ],
         }
 
     async def send_clarify(
@@ -2063,6 +2061,17 @@ class FeishuAdapter(BasePlatformAdapter):
             mark_awaiting_text(clarify_id)
             if message_id:
                 self._clarify_card_message_ids[chat_id] = message_id
+                logger.info(
+                    "[Feishu] send_clarify OK chat_id=%s message_id=%s clarify_id=%s; "
+                    "awaiting text resolve",
+                    chat_id, message_id, clarify_id,
+                )
+            else:
+                logger.warning(
+                    "[Feishu] send_clarify returned no message_id chat_id=%s clarify_id=%s; "
+                    "text-resolve PATCH will be skipped",
+                    chat_id, clarify_id,
+                )
             return SendResult(
                 success=True,
                 message_id=message_id,
@@ -2139,51 +2148,35 @@ class FeishuAdapter(BasePlatformAdapter):
             ],
         }
 
-    async def _fetch_tenant_access_token(self, *, domain: str) -> Optional[str]:
-        """Fetch a tenant access token from the Feishu auth endpoint.
-
-        Returns the token string, or None on failure.  Used by the
-        card-PATCH path which talks to Feishu directly via httpx
-        rather than going through the SDK.
-        """
-        if httpx is None:
-            logger.error("[Feishu] httpx unavailable; cannot fetch access token")
-            return None
-        try:
-            async with httpx.AsyncClient(timeout=15) as c:
-                token_resp = await c.post(
-                    f"{domain}/open-apis/auth/v3/tenant_access_token/internal",
-                    json={"app_id": self._app_id, "app_secret": self._app_secret},
-                )
-                token_data = token_resp.json()
-                access_token = token_data.get("tenant_access_token")
-                if not access_token:
-                    logger.warning(
-                        "[Feishu] access token fetch failed: [%s] %s",
-                        token_data.get("code"),
-                        token_data.get("msg", ""),
-                    )
-                return access_token
-        except Exception as exc:
-            logger.error(
-                "[Feishu] access token fetch raised: %s", exc, exc_info=True,
-            )
-            return None
-
     async def _patch_clarify_card(
         self,
         *,
         chat_id: str,
         message_id: str,
         choice_text: str,
-        lang: Optional[str] = None,
     ) -> SendResult:
+        """PATCH a previously sent clarify card to its "received" state.
+
+        Triggered when the user answers by free-text (rather than clicking
+        a button).  Goes through the SDK's ``im.v1.message.update`` so we
+        share the same auth / token / retry surface as the rest of the
+        adapter — there used to be a raw httpx path here, but it just
+        duplicated the SDK call.
+
+        Note: the upstream ``vividy/main`` SKILL
+        (``feishu-clarify-card-debugging`` Bad fix 24) considers this whole
+        "PATCH on text-resolve" feature a yattekisuru-graduation-drop
+        candidate (UX impact = "card stays ❓ until next interaction",
+        which the chat-pane text reply makes redundant).  This branch keeps
+        it intentionally because the user wants the card to visibly flip to
+        "received" when answering by typed text.  If the user changes their
+        mind, drop this helper + ``_fire_clarify_card_patch`` +
+        ``_clarify_card_message_ids`` together.
+        """
         if not self._client:
             return SendResult(success=False, error="Not connected")
         if not message_id:
             return SendResult(success=False, error="Missing message_id")
-        if httpx is None:
-            return SendResult(success=False, error="httpx unavailable")
 
         card = {
             "config": {"wide_screen_mode": True, "update_multi": True},
@@ -2198,47 +2191,55 @@ class FeishuAdapter(BasePlatformAdapter):
                 },
             ],
         }
-        content = json.dumps(card, ensure_ascii=False)
-
-        domain = FEISHU_DOMAIN if self._domain_name != "lark" else LARK_DOMAIN
         try:
-            access_token = await self._fetch_tenant_access_token(domain=domain)
-            if not access_token:
-                return SendResult(success=False, error="Failed to fetch access token")
-            async with httpx.AsyncClient(timeout=15) as c:
-                patch_resp = await c.patch(
-                    f"{domain}/open-apis/im/v1/messages/{message_id}",
-                    json={"content": content},
-                    headers={
-                        "Authorization": f"Bearer {access_token}",
-                        "Content-Type": "application/json; charset=utf-8",
-                    },
+            # Interactive card PATCH goes through the dedicated
+            # ``PATCH /im/v1/messages/:message_id`` endpoint ("Update
+            # sent message card").  The body carries `content` only and
+            # the card JSON itself must declare config.update_multi=true.
+            # Using PUT ("Edit message", text/post only) on an
+            # interactive card returns code 99992402 "field validation
+            # failed" — that was the bug found in 2026-06-11.
+            body = self._build_patch_message_body(
+                content=json.dumps(card, ensure_ascii=False),
+            )
+            request = self._build_patch_message_request(
+                message_id=message_id, request_body=body,
+            )
+            logger.debug(
+                "[Feishu] PATCH clarify card start chat_id=%s message_id=%s",
+                chat_id, message_id,
+            )
+            # Interactive cards MUST go through message.patch (the
+            # dedicated "Update sent message card" endpoint).  PUT is
+            # text/post only and rejects interactive cards with code
+            # 99992402.
+            response = await asyncio.to_thread(self._client.im.v1.message.patch, request)
+            logger.debug(
+                "[Feishu] PATCH clarify card response chat_id=%s message_id=%s success_attr=%s code=%s msg=%s",
+                chat_id, message_id,
+                bool(getattr(response, "success", lambda: None)()),
+                getattr(response, "code", None),
+                getattr(response, "msg", None),
+            )
+            result = self._finalize_send_result(response, "clarify patch failed")
+            if result.success:
+                result.message_id = message_id
+                logger.info(
+                    "[Feishu] PATCH clarify card OK chat_id=%s message_id=%s",
+                    chat_id, message_id,
                 )
-                response = _DummyResponse.from_dict(patch_resp.json())
+            else:
+                logger.warning(
+                    "[Feishu] PATCH clarify card REJECTED chat_id=%s message_id=%s error=%s",
+                    chat_id, message_id, result.error,
+                )
+            return result
         except Exception as exc:
             logger.error(
                 "[Feishu] Failed to patch clarify card %s: %s",
                 message_id, exc, exc_info=True,
             )
             return SendResult(success=False, error=str(exc))
-
-        code = response.code
-        msg = response.msg
-        logger.debug(
-            "[Feishu] clarify card PATCH response for %s: code=%s msg=%s choice=%r",
-            message_id, code, msg, choice_text,
-        )
-        if not self._response_succeeded(response):
-            logger.warning(
-                "[Feishu] clarify card PATCH failed for %s: [%s] %s",
-                message_id, code, msg,
-            )
-            return SendResult(
-                success=False,
-                error=f"[{code}] {msg}",
-                raw_response=response,
-            )
-        return SendResult(success=True, message_id=message_id)
 
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
@@ -5209,6 +5210,38 @@ class FeishuAdapter(BasePlatformAdapter):
         return SimpleNamespace(message_id=message_id, request_body=request_body)
 
     @staticmethod
+    def _build_patch_message_body(*, content: str) -> Any:
+        """Body for the ``PATCH /im/v1/messages/:message_id`` endpoint.
+
+        The PATCH endpoint ("Update sent message card") is the correct
+        one for editing interactive (card) messages.  Per the official
+        doc, the body carries ``content`` only — no ``msg_type`` — and
+        the card JSON itself must declare ``config.update_multi=true``
+        both before and after the update.  Using the PUT
+        ``/im/v1/messages/:message_id`` endpoint ("Edit message") for
+        interactive cards returns code 99992402 "field validation
+        failed" because PUT only accepts text/post messages.
+        """
+        if "PatchMessageRequestBody" in globals():
+            return (
+                PatchMessageRequestBody.builder()
+                .content(content)
+                .build()
+            )
+        return SimpleNamespace(content=content)
+
+    @staticmethod
+    def _build_patch_message_request(message_id: str, request_body: Any) -> Any:
+        if "PatchMessageRequest" in globals():
+            return (
+                PatchMessageRequest.builder()
+                .message_id(message_id)
+                .request_body(request_body)
+                .build()
+            )
+        return SimpleNamespace(message_id=message_id, request_body=request_body)
+
+    @staticmethod
     def _build_create_message_body(*, receive_id: str, msg_type: str, content: str, uuid_value: str) -> Any:
         if "CreateMessageRequestBody" in globals():
             return (
@@ -5637,37 +5670,3 @@ def _qr_register_inner(
     return result
 
 
-class _DummyResponse:
-    """Lightweight response shim used by ``_feishu_patch_message``.
-
-    The lark_oapi SDK normally returns an object with a ``success()``
-    method plus ``code``/``msg`` attributes.  Our raw-httpx PATCH path
-    needs to expose the same surface so the surrounding
-    ``_patch_clarify_card`` code can treat the result uniformly
-    (``self._response_succeeded(response)`` and direct ``response.code``
-    / ``response.msg`` reads).  We do NOT need to mimic the SDK's
-    ``response.succeed()`` / ``response.failed()`` helpers — only the
-    boolean + code/msg triple is read in the PATCH path.
-
-    The single source of truth for "succeeded?" is ``code == 0`` (per
-    the Lark Open API spec), so ``success`` is a derived property
-    rather than a stored field.  Callers that need the boolean should
-    go through ``success()`` (kept for SDK parity) — direct access to
-    ``code`` is the authoritative check.
-    """
-
-    __slots__ = ("code", "msg")
-
-    def __init__(self, *, code: int, msg: str) -> None:
-        self.code = code
-        self.msg = msg
-
-    def success(self) -> bool:  # noqa: D401 — SDK-parity shim method
-        return self.code == 0
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "_DummyResponse":
-        return cls(
-            code=int(data.get("code", -1)),
-            msg=str(data.get("msg", "")),
-        )
